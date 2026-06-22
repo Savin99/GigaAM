@@ -66,14 +66,21 @@ CPU; override with `MAC_TRANSCRIBER_DIARIZATION_DEVICE` if needed.
 
 When some participants share a single room microphone, their Zoom track holds several
 voices but is labelled with one name. Set `MAC_TRANSCRIBER_DIARIZE_TRACKS=1` to run
-diarization *inside each participant track*: a track with one voice keeps its Zoom name
-(clean remote participants are untouched), a track with two or more voices is split into
-`Speaker 1`, `Speaker 2`, … numbered across the whole meeting. This requires the same
-`HF_TOKEN`. It is **off by default** because it runs the full pyannote pipeline once per
-track, so an all-remote call with N clean tracks would pay N runs for no benefit; enable
-it only for hybrid (room + remote) meetings. Optional cap per track:
-`MAC_TRANSCRIBER_DIARIZE_TRACKS_MAX_SPEAKERS`. Speaker labels stay anonymous — mapping
-`Speaker N` to real names (voice enrollment from past isolated tracks) is a separate step.
+diarization *inside each participant track*: a track with one real voice keeps its Zoom
+name (clean remote participants are untouched), a track with two or more real voices is
+split into `Speaker 1`, `Speaker 2`, … numbered across the whole meeting. Requires the
+same `HF_TOKEN`.
+
+A track counts as a shared microphone only if it has **≥2 clusters above
+`MAC_TRANSCRIBER_DIARIZE_TRACKS_MIN_SPEAKER_S`** (default `20` seconds). This guard is
+essential: pyannote emits tiny (1–9 s) spurious clusters even on a clean single-speaker
+track, and without the floor that noise was counted as a second speaker and fragmented
+clean all-remote tracks into bogus `Speaker N`. On real meetings the gap is wide (noise
+≤9 s vs real voices ≥160 s), so the floor cleanly separates the two cases and makes this
+safe to enable globally. Optional hard cap per track:
+`MAC_TRANSCRIBER_DIARIZE_TRACKS_MAX_SPEAKERS`. It runs the full pyannote pipeline once per
+track (~7 min/73-min track on MPS). Speaker labels stay anonymous — mapping `Speaker N`
+to real names (voice enrollment) is a separate step.
 
 ### Speech segmentation backend (VAD)
 

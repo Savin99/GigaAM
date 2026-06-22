@@ -80,6 +80,8 @@ def test_speaker_tracks_from_segments_multi_pairs():
 
 def test_per_track_splits_room_keeps_clean(monkeypatch):
     """01.m4a — комната (2 голоса) -> Speaker 1/2; 02.m4a — чистый Aziz -> имя."""
+    # короткие тестовые сегменты -> понижаем порог заметного говорящего
+    monkeypatch.setenv("MAC_TRANSCRIBER_DIARIZE_TRACKS_MIN_SPEAKER_S", "0.5")
     in_room = asr.TrackSpec(path=Path("/in/01.m4a"), speaker="Ilya")
     clean = asr.TrackSpec(path=Path("/in/02.m4a"), speaker="Aziz")
 
@@ -109,6 +111,7 @@ def test_per_track_splits_room_keeps_clean(monkeypatch):
 
 def test_per_track_global_speaker_numbering(monkeypatch):
     """Две дорожки-комнаты: нумерация не сбрасывается (Speaker 1..4)."""
+    monkeypatch.setenv("MAC_TRANSCRIBER_DIARIZE_TRACKS_MIN_SPEAKER_S", "0.5")
     room_a = asr.TrackSpec(path=Path("/in/01.m4a"), speaker="RoomA")
     room_b = asr.TrackSpec(path=Path("/in/02.m4a"), speaker="RoomB")
 
@@ -146,6 +149,42 @@ def test_per_track_falls_back_when_diarization_unavailable(monkeypatch):
 
     segments = asr.build_per_track_segments([track], device="cpu", metadata={})
     assert [s.speaker for s in segments] == ["Ilya"]
+
+
+def test_per_track_ignores_tiny_noise_cluster(monkeypatch):
+    """Регресс: 1 большой голос + крошечный шум -> имя из Zoom, НЕ дробим на Speaker N.
+
+    Именно отсутствие порога ломало all-remote встречи: 2-секундный шумовой кластер
+    считался вторым спикером и дробил чистую дорожку.
+    """
+    monkeypatch.setenv("MAC_TRANSCRIBER_DIARIZE_TRACKS_MIN_SPEAKER_S", "20")
+    track = asr.TrackSpec(path=Path("/in/01.m4a"), speaker="Вячеслав")
+
+    def fake_diarized(path, *, device, metadata, options=None, name_offset=0):
+        return [
+            _seg("Speaker 1", "01.m4a", 0.0, 60.0),  # 60с — реальный голос
+            _seg("Speaker 1", "01.m4a", 60.0, 100.0),  # ещё 40с
+            _seg("Speaker 2", "01.m4a", 100.0, 102.0),  # 2с — шум, ниже порога
+        ]
+
+    def fake_build_segments(tracks, progress_callback=None):
+        return [_seg(tracks[0].speaker, tracks[0].path.name, 0.0, 1.0)]
+
+    monkeypatch.setattr(asr, "build_diarized_segments", fake_diarized)
+    monkeypatch.setattr(asr, "build_segments", fake_build_segments)
+
+    segments = asr.build_per_track_segments([track], device="cpu", metadata={})
+    assert {s.speaker for s in segments} == {"Вячеслав"}
+
+
+def test_track_min_speaker_seconds_parsing(monkeypatch):
+    monkeypatch.delenv("MAC_TRANSCRIBER_DIARIZE_TRACKS_MIN_SPEAKER_S", raising=False)
+    assert asr.track_min_speaker_seconds() == 20.0
+    monkeypatch.setenv("MAC_TRANSCRIBER_DIARIZE_TRACKS_MIN_SPEAKER_S", "30")
+    assert asr.track_min_speaker_seconds() == 30.0
+    for bad in ("bad", "-5", "0"):
+        monkeypatch.setenv("MAC_TRANSCRIBER_DIARIZE_TRACKS_MIN_SPEAKER_S", bad)
+        assert asr.track_min_speaker_seconds() == 20.0
 
 
 # --- маршрутизация build_input_segments по флагу ----------------------------

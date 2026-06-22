@@ -6,8 +6,9 @@ import os
 import re
 import subprocess
 import time
+from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING
@@ -299,6 +300,22 @@ def build_input_segments(
     return build_segments(tracks, progress_callback=progress_callback), tracks
 
 
+def track_min_speaker_seconds() -> float:
+    """Порог talk-time, выше которого кластер считается РЕАЛЬНЫМ говорящим (сек).
+
+    Диаризация плодит крошечные (1–9с) ложные кластеры даже на чистой дорожке одного
+    человека. Без порога такой шум считался «вторым спикером» и дробил чистую дорожку на
+    ``Speaker N`` (регресс на all-remote встречах). На реальных данных разрыв огромный:
+    шум ≤9с против реальных голосов ≥160с, так что ~20с надёжно разделяет.
+    """
+    raw = os.environ.get("MAC_TRANSCRIBER_DIARIZE_TRACKS_MIN_SPEAKER_S", "20")
+    try:
+        value = float(raw)
+    except ValueError:
+        return 20.0
+    return value if value > 0 else 20.0
+
+
 def build_per_track_segments(
     tracks: list[TrackSpec],
     *,
@@ -308,33 +325,42 @@ def build_per_track_segments(
 ) -> list[Segment]:
     """Сегментация по дорожкам с диаризацией ВНУТРИ каждой дорожки.
 
-    Для каждой дорожки запускаем pyannote:
-      * 0–1 спикера (или диаризация недоступна) — оставляем имя дорожки из Zoom: чистый
-        удалённый участник остаётся под своим именем, как в :func:`build_segments`;
-      * ≥2 спикеров (общий микрофон в переговорке) — режем дорожку на отдельных
-        говорящих со сквозной нумерацией ``Speaker N`` по всей встрече.
+    Для каждой дорожки запускаем pyannote и считаем talk-time по кластерам:
+      * <2 говорящих ВЫШЕ порога :func:`track_min_speaker_seconds` (или диаризация
+        недоступна) — чистый удалённый участник: оставляем имя дорожки из Zoom через
+        :func:`build_segments`. Крошечные шумовые кластеры порог отсекает;
+      * ≥2 заметных говорящих (общий микрофон в переговорке) — режем дорожку на них со
+        сквозной нумерацией ``Speaker N`` по всей встрече, шумовые кластеры выкидываем.
     """
     segments: list[Segment] = []
     speaker_offset = 0
     total = len(tracks)
     options = per_track_diarization_options()
+    min_speaker_s = track_min_speaker_seconds()
     for index, track in enumerate(tracks, start=1):
         try:
             diarized = build_diarized_segments(
-                track.path,
-                device=device,
-                metadata=metadata,
-                options=options,
-                name_offset=speaker_offset,
+                track.path, device=device, metadata=metadata, options=options
             )
         except DiarizationUnavailable:
             diarized = []
-        distinct = {segment.speaker for segment in diarized}
-        if len(distinct) >= 2:
-            segments.extend(diarized)
-            speaker_offset += len(distinct)
+        talk: dict[str, float] = defaultdict(float)
+        for segment in diarized:
+            talk[segment.speaker] += segment.end - segment.start
+        substantial = {sp for sp, total_s in talk.items() if total_s >= min_speaker_s}
+        if len(substantial) >= 2:
+            # Общий микрофон: оставляем только заметных говорящих, сквозная нумерация
+            # по порядку появления (без дыр, даже если шумовой кластер выкинут).
+            renumber: dict[str, str] = {}
+            for segment in diarized:
+                if segment.speaker not in substantial:
+                    continue
+                if segment.speaker not in renumber:
+                    speaker_offset += 1
+                    renumber[segment.speaker] = f"Speaker {speaker_offset}"
+                segments.append(replace(segment, speaker=renumber[segment.speaker]))
         else:
-            # 0–1 спикера: доверяем Zoom-имени дорожки, обычный VAD-путь.
+            # 0–1 заметного говорящего: доверяем Zoom-имени дорожки, обычный VAD-путь.
             segments.extend(build_segments([track]))
         if progress_callback is not None:
             progress_callback(index, total, len(segments))
