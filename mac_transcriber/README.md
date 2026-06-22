@@ -62,6 +62,19 @@ For single-file speaker diarization, accept the Hugging Face terms for
 `HF_TOKEN` when installing/running the LaunchAgent. The default diarization device is
 CPU; override with `MAC_TRANSCRIBER_DIARIZATION_DEVICE` if needed.
 
+#### In-room shared microphone (per-track diarization)
+
+When some participants share a single room microphone, their Zoom track holds several
+voices but is labelled with one name. Set `MAC_TRANSCRIBER_DIARIZE_TRACKS=1` to run
+diarization *inside each participant track*: a track with one voice keeps its Zoom name
+(clean remote participants are untouched), a track with two or more voices is split into
+`Speaker 1`, `Speaker 2`, … numbered across the whole meeting. This requires the same
+`HF_TOKEN`. It is **off by default** because it runs the full pyannote pipeline once per
+track, so an all-remote call with N clean tracks would pay N runs for no benefit; enable
+it only for hybrid (room + remote) meetings. Optional cap per track:
+`MAC_TRANSCRIBER_DIARIZE_TRACKS_MAX_SPEAKERS`. Speaker labels stay anonymous — mapping
+`Speaker N` to real names (voice enrollment from past isolated tracks) is a separate step.
+
 ### Speech segmentation backend (VAD)
 
 `build_segments` splits each track (Zoom participant tracks and the single-file

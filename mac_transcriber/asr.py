@@ -287,7 +287,59 @@ def build_input_segments(
                 progress_callback(1, 1, len(segments))
             return segments, speaker_tracks_from_segments(tracks[0].path, segments)
 
+    if diarization_enabled() and diarize_tracks_enabled():
+        segments = build_per_track_segments(
+            tracks,
+            device=device,
+            metadata=metadata,
+            progress_callback=progress_callback,
+        )
+        return segments, speaker_tracks_from_segments_multi(tracks, segments)
+
     return build_segments(tracks, progress_callback=progress_callback), tracks
+
+
+def build_per_track_segments(
+    tracks: list[TrackSpec],
+    *,
+    device: str,
+    metadata: dict,
+    progress_callback: Callable[[int, int, int], None] | None = None,
+) -> list[Segment]:
+    """Сегментация по дорожкам с диаризацией ВНУТРИ каждой дорожки.
+
+    Для каждой дорожки запускаем pyannote:
+      * 0–1 спикера (или диаризация недоступна) — оставляем имя дорожки из Zoom: чистый
+        удалённый участник остаётся под своим именем, как в :func:`build_segments`;
+      * ≥2 спикеров (общий микрофон в переговорке) — режем дорожку на отдельных
+        говорящих со сквозной нумерацией ``Speaker N`` по всей встрече.
+    """
+    segments: list[Segment] = []
+    speaker_offset = 0
+    total = len(tracks)
+    options = per_track_diarization_options()
+    for index, track in enumerate(tracks, start=1):
+        try:
+            diarized = build_diarized_segments(
+                track.path,
+                device=device,
+                metadata=metadata,
+                options=options,
+                name_offset=speaker_offset,
+            )
+        except DiarizationUnavailable:
+            diarized = []
+        distinct = {segment.speaker for segment in diarized}
+        if len(distinct) >= 2:
+            segments.extend(diarized)
+            speaker_offset += len(distinct)
+        else:
+            # 0–1 спикера: доверяем Zoom-имени дорожки, обычный VAD-путь.
+            segments.extend(build_segments([track]))
+        if progress_callback is not None:
+            progress_callback(index, total, len(segments))
+    segments.sort(key=lambda segment: (segment.start, segment.end, segment.speaker))
+    return segments
 
 
 def build_diarized_segments(
@@ -295,14 +347,23 @@ def build_diarized_segments(
     *,
     device: str,
     metadata: dict,
+    options: dict[str, int] | None = None,
+    name_offset: int = 0,
 ) -> list[Segment]:
-    turns = diarize_audio(audio_path, device=device, metadata=metadata)
+    # options=None -> зовём diarize_audio по старой сигнатуре (single-mixed путь и его
+    # моки не знают про options); пер-трековый путь передаёт options явно.
+    if options is None:
+        turns = diarize_audio(audio_path, device=device, metadata=metadata)
+    else:
+        turns = diarize_audio(
+            audio_path, device=device, metadata=metadata, options=options
+        )
     if not turns:
         return []
 
     wav = gigaam.load_audio(str(audio_path)).cpu()
     _mask, rms, _threshold = activity_mask(wav)
-    speaker_names = stable_speaker_names(turns)
+    speaker_names = stable_speaker_names(turns, offset=name_offset)
     segments: list[Segment] = []
     min_len = int(MIN_SEGMENT_S * SR)
     pad = int(DIARIZATION_PAD_S * SR)
@@ -328,15 +389,20 @@ def build_diarized_segments(
 
 
 def diarize_audio(
-    audio_path: Path, *, device: str, metadata: dict
+    audio_path: Path,
+    *,
+    device: str,
+    metadata: dict,
+    options: dict[str, int] | None = None,
 ) -> list[DiarizedTurn]:
     if not diarization_enabled():
         raise DiarizationUnavailable("diarization disabled")
 
     pipeline = load_diarization_pipeline(device=device)
     prepared_path = prepare_diarization_audio(audio_path)
+    pipeline_options = options if options is not None else diarization_options(metadata)
     try:
-        output = pipeline(str(prepared_path), **diarization_options(metadata))
+        output = pipeline(str(prepared_path), **pipeline_options)
     except Exception as exc:  # noqa: BLE001
         raise DiarizationUnavailable(f"diarization failed: {exc}") from exc
 
@@ -425,6 +491,31 @@ def diarization_enabled() -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+def diarize_tracks_enabled() -> bool:
+    """Диаризация ВНУТРИ каждой дорожки мультитрек-входа (общий микрофон в комнате).
+
+    По умолчанию ВЫКЛ: иначе обычная встреча из N чистых remote-дорожек платит N полных
+    прогонов pyannote впустую. Включать для гибридных созвонов, где часть участников
+    сидит в переговорке на одном микрофоне (одна Zoom-дорожка = несколько людей).
+    """
+    value = os.environ.get("MAC_TRANSCRIBER_DIARIZE_TRACKS", "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def per_track_diarization_options() -> dict[str, int]:
+    """Опции диаризации для ОДНОЙ дорожки.
+
+    В отличие от :func:`diarization_options` НЕ навязываем ``num_speakers`` по числу
+    участников встречи: в одной дорожке их не все, и чистую дорожку удалённого участника
+    нельзя резать на N голосов. Берём только необязательный потолок из env.
+    """
+    options: dict[str, int] = {}
+    max_speakers = positive_int_env("MAC_TRANSCRIBER_DIARIZE_TRACKS_MAX_SPEAKERS")
+    if max_speakers is not None:
+        options["max_speakers"] = max_speakers
+    return options
+
+
 def diarization_options(metadata: dict) -> dict[str, int]:
     options: dict[str, int] = {}
     participants = metadata.get("participants")
@@ -511,11 +602,13 @@ def merge_diarized_turns(turns: list[DiarizedTurn]) -> list[DiarizedTurn]:
     return merged
 
 
-def stable_speaker_names(turns: list[DiarizedTurn]) -> dict[str, str]:
+def stable_speaker_names(
+    turns: list[DiarizedTurn], *, offset: int = 0
+) -> dict[str, str]:
     names: dict[str, str] = {}
     for turn in turns:
         if turn.speaker not in names:
-            names[turn.speaker] = f"Speaker {len(names) + 1}"
+            names[turn.speaker] = f"Speaker {offset + len(names) + 1}"
     return names
 
 
@@ -527,6 +620,26 @@ def speaker_tracks_from_segments(
         if segment.speaker not in speakers:
             speakers.append(segment.speaker)
     return [TrackSpec(path=audio_path, speaker=speaker) for speaker in speakers]
+
+
+def speaker_tracks_from_segments_multi(
+    tracks: list[TrackSpec], segments: list[Segment]
+) -> list[TrackSpec]:
+    """Список говорящих после пер-трековой диаризации — по парам (дорожка, спикер).
+
+    Чистая дорожка даёт одну пару (Zoom-имя), общий микрофон — несколько (``Speaker N``).
+    Используется для ``speaker_track_map.tsv``.
+    """
+    path_by_name = {track.path.name: track.path for track in tracks}
+    ordered: list[tuple[str, str]] = []
+    for segment in segments:
+        key = (segment.track, segment.speaker)
+        if key not in ordered:
+            ordered.append(key)
+    return [
+        TrackSpec(path=path_by_name.get(name, Path(name)), speaker=speaker)
+        for name, speaker in ordered
+    ]
 
 
 def _is_single_mixed_file(*, input_dir: Path, tracks: list[TrackSpec]) -> bool:
