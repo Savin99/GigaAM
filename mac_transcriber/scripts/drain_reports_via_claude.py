@@ -135,6 +135,12 @@ def _generate_payload(work: Path, model: str) -> str:
     ]
     if model:
         cmd += ["--model", model]
+    # Уровень размышления headless-агента. Читаем env ЗДЕСЬ (вызов идёт уже после
+    # _load_env_files), иначе значение из .env.local не долетело бы до argparse-дефолта.
+    # Пусто -> флаг не добавляем, claude берёт свой дефолт. Уровни: low|medium|high|xhigh|max.
+    effort = (os.environ.get("MAC_TRANSCRIBER_REPORT_EFFORT") or "").strip()
+    if effort:
+        cmd += ["--effort", effort]
     # DISABLE_AUTOUPDATER: фоновый джоб НЕ инициирует само-обновление claude (чтобы
     # неинтерактивный запуск не прыгнул на потенциально несовместимую версию сам по
     # себе). Обновления прилетают из интерактивных сессий пользователя; джоб берёт
