@@ -79,7 +79,10 @@ def test_speaker_tracks_from_segments_multi_pairs():
 
 
 def test_per_track_splits_room_keeps_clean(monkeypatch):
-    """01.m4a — комната (2 голоса) -> Speaker 1/2; 02.m4a — чистый Aziz -> имя."""
+    """01.m4a — комната (2 голоса): доминирующий -> Zoom-имя Ilya, второй -> Speaker N.
+
+    02.m4a — чистый Aziz -> имя сохраняется.
+    """
     # короткие тестовые сегменты -> понижаем порог заметного говорящего
     monkeypatch.setenv("MAC_TRANSCRIBER_DIARIZE_TRACKS_MIN_SPEAKER_S", "0.5")
     in_room = asr.TrackSpec(path=Path("/in/01.m4a"), speaker="Ilya")
@@ -88,8 +91,10 @@ def test_per_track_splits_room_keeps_clean(monkeypatch):
     def fake_diarized(path, *, device, metadata, options=None, name_offset=0):
         if path.name == "01.m4a":
             return [
-                _seg(f"Speaker {name_offset + 1}", "01.m4a", 0.0, 1.0),
-                _seg(f"Speaker {name_offset + 2}", "01.m4a", 2.0, 3.0),
+                _seg(
+                    f"Speaker {name_offset + 1}", "01.m4a", 0.0, 1.0
+                ),  # 2с -> доминирует
+                _seg(f"Speaker {name_offset + 2}", "01.m4a", 2.0, 3.0),  # 1с
                 _seg(f"Speaker {name_offset + 1}", "01.m4a", 4.0, 5.0),
             ]
         return []  # чистая дорожка: диаризация не нашла второго голоса
@@ -104,16 +109,21 @@ def test_per_track_splits_room_keeps_clean(monkeypatch):
     segments = asr.build_per_track_segments([in_room, clean], device="cpu", metadata={})
 
     speakers = {segment.speaker for segment in segments}
-    assert speakers == {"Speaker 1", "Speaker 2", "Aziz"}
+    # доминирующий голос комнаты унаследовал Zoom-имя дорожки, второй пронумерован
+    assert speakers == {"Ilya", "Speaker 1", "Aziz"}
+    # имя Ilya достаётся доминирующему по talk-time кластеру (2с против 1с)
+    ilya_starts = sorted(s.start for s in segments if s.speaker == "Ilya")
+    assert ilya_starts == [0.0, 4.0]
     # отсортировано по времени
     assert [round(s.start, 1) for s in segments] == [0.0, 2.0, 4.0, 10.0]
 
 
 def test_per_track_global_speaker_numbering(monkeypatch):
-    """Две дорожки-комнаты: нумерация не сбрасывается (Speaker 1..4)."""
+    """Две дорожки-комнаты без реальных Zoom-имён: нумерация не сбрасывается (Speaker 1..4)."""
     monkeypatch.setenv("MAC_TRANSCRIBER_DIARIZE_TRACKS_MIN_SPEAKER_S", "0.5")
-    room_a = asr.TrackSpec(path=Path("/in/01.m4a"), speaker="RoomA")
-    room_b = asr.TrackSpec(path=Path("/in/02.m4a"), speaker="RoomB")
+    # служебные имена дорожек (нет реального участника) -> наследовать нечего, нумеруем всех
+    room_a = asr.TrackSpec(path=Path("/in/01.m4a"), speaker="Zoom participant 1")
+    room_b = asr.TrackSpec(path=Path("/in/02.m4a"), speaker="Zoom participant 2")
 
     def fake_diarized(path, *, device, metadata, options=None, name_offset=0):
         return [
@@ -133,6 +143,46 @@ def test_per_track_global_speaker_numbering(monkeypatch):
         "Speaker 3",
         "Speaker 4",
     }
+
+
+def test_is_placeholder_speaker():
+    # служебные метки дорожки -> наследовать нечего
+    assert asr._is_placeholder_speaker("Speaker") is True
+    assert asr._is_placeholder_speaker("Speaker 2") is True
+    assert asr._is_placeholder_speaker("Zoom participant 1") is True
+    assert asr._is_placeholder_speaker(None) is True  # отсутствие имени тоже служебное
+    # реальные Zoom-имена -> наследуются доминирующему говорящему
+    assert asr._is_placeholder_speaker("Ilya") is False
+    assert asr._is_placeholder_speaker("Вячеслав") is False
+
+
+def test_per_track_dominant_inherits_zoom_name(monkeypatch):
+    """Регресс по сегодняшнему созвону: дорожка Ilya с двумя голосами не должна терять имя.
+
+    Раньше при ≥2 заметных голосах на дорожке оба становились Speaker N и Zoom-имя
+    терялось. Теперь доминирующий по talk-time кластер наследует имя дорожки.
+    """
+    monkeypatch.setenv("MAC_TRANSCRIBER_DIARIZE_TRACKS_MIN_SPEAKER_S", "20")
+    track = asr.TrackSpec(path=Path("/in/02.m4a"), speaker="Ilya")
+
+    def fake_diarized(path, *, device, metadata, options=None, name_offset=0):
+        return [
+            _seg("Speaker 1", "02.m4a", 0.0, 160.0),  # 160с -> доминирует, это Ilya
+            _seg(
+                "Speaker 2", "02.m4a", 160.0, 220.0
+            ),  # 60с -> второй человек в комнате
+        ]
+
+    monkeypatch.setattr(asr, "build_diarized_segments", fake_diarized)
+    monkeypatch.setattr(
+        asr, "build_segments", lambda *a, **k: (_ for _ in ()).throw(AssertionError)
+    )
+
+    segments = asr.build_per_track_segments([track], device="cpu", metadata={})
+    by_speaker = {s.speaker: s.start for s in segments}
+    assert set(by_speaker) == {"Ilya", "Speaker 1"}
+    assert by_speaker["Ilya"] == 0.0  # доминирующий кластер
+    assert by_speaker["Speaker 1"] == 160.0
 
 
 def test_per_track_falls_back_when_diarization_unavailable(monkeypatch):
