@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import traceback
 import uuid
 from datetime import UTC, datetime
@@ -115,46 +116,88 @@ async def create_meeting(
     topic: str | None = Form(default=None),
     participants: str | None = Form(default=None),
     zoom_participant_tracks_json: str | None = Form(default=None),
+    request_id: str | None = Form(default=None),
 ) -> dict[str, str]:
-    meeting_id = str(uuid.uuid4())
+    meeting_id = _meeting_id_for_request(request_id)
     meeting_dir = ROOT / "meetings" / meeting_id
-    input_dir = meeting_dir / "input"
+    existing = _read_status(meeting_dir)
+    if existing:
+        return {"id": meeting_id, "status": str(existing.get("status") or "uploaded")}
+
+    # Idempotent submissions are first written outside the live meetings tree and
+    # moved into place only after every multipart file is complete. A client may
+    # safely retry after a broken SSH/HTTP connection: it either recovers the
+    # existing request_id or starts from a clean staging directory.
+    staging_dir = (
+        ROOT / ".uploads" / f"{meeting_id}-{uuid.uuid4()}"
+        if request_id
+        else None
+    )
+    upload_dir = staging_dir or meeting_dir
+    input_dir = upload_dir / "input"
     participants_dir = input_dir / "participants"
     participants_dir.mkdir(parents=True, exist_ok=False)
 
-    await _save_upload(file, input_dir / "audio.m4a")
-    for index, upload in enumerate(zoom_participant_files or [], start=1):
-        await _save_upload(upload, participants_dir / f"{index:02d}.m4a")
+    try:
+        await _save_upload(file, input_dir / "audio.m4a")
+        for index, upload in enumerate(zoom_participant_files or [], start=1):
+            await _save_upload(upload, participants_dir / f"{index:02d}.m4a")
 
-    metadata = {
-        "meeting_id": meeting_id,
-        "source_filename": file.filename,
-        "language_code": language_code,
-        "processing_mode": processing_mode,
-        "participants": _split_csv(participants),
-        "zoom_participant_tracks": _parse_tracks(zoom_participant_tracks_json),
-    }
-    metadata["title"] = resolve_meeting_title(
-        {
-            **metadata,
-            "title": title,
-            "meeting_title": meeting_title,
-            "topic": topic,
-        },
-        meeting_dir=meeting_dir,
-    )
-    _write_status(
-        meeting_dir,
-        "uploaded",
-        phase="uploaded",
-        progress=0.01,
-        message="Upload complete",
-        metadata=metadata,
-    )
-    (input_dir / "metadata.json").write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+        metadata = {
+            "meeting_id": meeting_id,
+            "source_request_id": request_id,
+            "source_filename": file.filename,
+            "language_code": language_code,
+            "processing_mode": processing_mode,
+            "participants": _split_csv(participants),
+            "zoom_participant_tracks": _parse_tracks(zoom_participant_tracks_json),
+        }
+        metadata["title"] = resolve_meeting_title(
+            {
+                **metadata,
+                "title": title,
+                "meeting_title": meeting_title,
+                "topic": topic,
+            },
+            meeting_dir=meeting_dir,
+        )
+        _write_status(
+            upload_dir,
+            "uploaded",
+            phase="uploaded",
+            progress=0.01,
+            message="Upload complete",
+            metadata=metadata,
+        )
+        (input_dir / "metadata.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        if staging_dir is not None:
+            status_path = staging_dir / "status.json"
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            status["id"] = meeting_id
+            status_path.write_text(
+                json.dumps(status, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            meeting_dir.parent.mkdir(parents=True, exist_ok=True)
+            if meeting_dir.exists():
+                existing = _read_status(meeting_dir)
+                if existing:
+                    return {
+                        "id": meeting_id,
+                        "status": str(existing.get("status") or "uploaded"),
+                    }
+                raise HTTPException(
+                    status_code=409,
+                    detail="An incomplete meeting with this request_id already exists",
+                )
+            staging_dir.rename(meeting_dir)
+    finally:
+        if staging_dir is not None and staging_dir.exists():
+            shutil.rmtree(staging_dir)
 
     background_tasks.add_task(_process_meeting, meeting_id)
     return {"id": meeting_id, "status": "uploaded"}
@@ -406,6 +449,18 @@ async def _save_upload(upload: UploadFile, path: Path) -> None:
                 break
             file_obj.write(chunk)
     await upload.close()
+
+
+def _meeting_id_for_request(request_id: str | None) -> str:
+    if not request_id:
+        return str(uuid.uuid4())
+    try:
+        return str(uuid.UUID(request_id))
+    except (AttributeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail="request_id must be a UUID",
+        ) from None
 
 
 def _meeting_dir(meeting_id: str) -> Path:

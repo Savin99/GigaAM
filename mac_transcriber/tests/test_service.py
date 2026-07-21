@@ -1,4 +1,5 @@
 import json
+import uuid
 
 from fastapi.testclient import TestClient
 
@@ -179,6 +180,53 @@ def test_create_meeting_persists_form_title(tmp_path, monkeypatch):
         )
     )
     assert metadata["title"] == "Проектный синк"
+
+
+def test_create_meeting_request_id_is_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setattr(service, "ROOT", tmp_path)
+    monkeypatch.setattr(service, "API_KEY", "")
+    processed = []
+    monkeypatch.setattr(
+        service, "_process_meeting", lambda meeting_id: processed.append(meeting_id)
+    )
+    request_id = str(uuid.uuid4())
+    client = TestClient(service.app)
+
+    first = client.post(
+        "/meetings",
+        data={"request_id": request_id, "title": "Retry-safe sync"},
+        files={"file": ("recording.m4a", b"first audio", "audio/mp4")},
+    )
+    second = client.post(
+        "/meetings",
+        data={"request_id": request_id, "title": "Duplicate retry"},
+        files={"file": ("recording.m4a", b"second audio", "audio/mp4")},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["id"] == request_id
+    assert second.json()["id"] == request_id
+    assert processed == [request_id]
+    input_dir = tmp_path / "meetings" / request_id / "input"
+    assert (input_dir / "audio.m4a").read_bytes() == b"first audio"
+    metadata = json.loads((input_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["source_request_id"] == request_id
+
+
+def test_create_meeting_rejects_non_uuid_request_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(service, "ROOT", tmp_path)
+    monkeypatch.setattr(service, "API_KEY", "")
+    client = TestClient(service.app)
+
+    response = client.post(
+        "/meetings",
+        data={"request_id": "../../unsafe"},
+        files={"file": ("recording.m4a", b"audio", "audio/mp4")},
+    )
+
+    assert response.status_code == 400
+    assert not (tmp_path / "meetings").exists()
 
 
 def test_create_meeting_derives_title_from_zoom_filename(tmp_path, monkeypatch):
