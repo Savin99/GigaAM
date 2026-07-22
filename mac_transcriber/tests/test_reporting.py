@@ -2467,6 +2467,11 @@ def test_asr_write_artifacts_defaults_to_ai_and_pdf_for_service_jobs(
 ):
     monkeypatch.delenv("MAC_TRANSCRIBER_REPORT_MODE", raising=False)
     monkeypatch.delenv("MAC_TRANSCRIBER_REPORT_PDF", raising=False)
+    monkeypatch.setattr(
+        reporting,
+        "build_ai_report",
+        lambda *, base_report, **_kwargs: base_report,
+    )
 
     asr.write_artifacts(
         output_dir=tmp_path,
