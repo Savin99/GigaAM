@@ -23,6 +23,7 @@ mac-transcriber-tests:
     - apt-get update -qq
     - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg libsndfile1
     - python -m pip install --upgrade pip setuptools wheel
+    - python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.10.*" "torchaudio==2.10.*"
     - python -m pip install -e ".[tests]" -r mac_transcriber/requirements.txt
   script:
     - PYTHONPATH=. python -m pytest -q --junitxml=mac-transcriber-junit.xml mac_transcriber/tests
