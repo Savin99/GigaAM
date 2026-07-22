@@ -124,13 +124,17 @@ def transcribe_meeting(
     )
     metadata = _load_json(input_dir / "metadata.json")
     tracks = _track_specs(input_dir=input_dir, metadata=metadata)
+    # Число аудиодорожек на входе. Ниже build_input_segments переназначает ``tracks`` на
+    # список пар (дорожка, спикер) для speaker_track_map — он длиннее при сплите общего
+    # микрофона, поэтому счётчики статуса считаем по исходным дорожкам, а не по парам.
+    audio_track_count = len(tracks)
     _emit_progress(
         status_callback,
         "processing",
         phase="segmenting",
         progress=0.12,
         message="Detecting speech segments",
-        tracks_total=len(tracks),
+        tracks_total=audio_track_count,
     )
 
     def on_segmenting_progress(done: int, total: int, segments_count: int) -> None:
@@ -161,7 +165,7 @@ def transcribe_meeting(
         else "No speech segments found",
         segments_done=0,
         segments_total=len(segments),
-        tracks_total=len(tracks),
+        tracks_total=audio_track_count,
     )
 
     def on_segment_progress(done: int, total: int) -> None:
@@ -173,7 +177,7 @@ def transcribe_meeting(
             message="Transcribing speech segments",
             segments_done=done,
             segments_total=total,
-            tracks_total=len(tracks),
+            tracks_total=audio_track_count,
         )
 
     segments = transcribe_segments(
@@ -192,7 +196,7 @@ def transcribe_meeting(
         message="Writing transcript artifacts",
         segments_done=len(segments),
         segments_total=len(segments),
-        tracks_total=len(tracks),
+        tracks_total=audio_track_count,
     )
     write_artifacts(
         output_dir=output_dir,
@@ -316,6 +320,21 @@ def track_min_speaker_seconds() -> float:
     return value if value > 0 else 20.0
 
 
+_PLACEHOLDER_SPEAKER_RE = re.compile(r"^(?:Speaker|Zoom participant)\b", re.IGNORECASE)
+
+
+def _is_placeholder_speaker(name: str | None) -> bool:
+    """Служебная метка дорожки без реального Zoom-участника (``Speaker``/``Zoom participant N``).
+
+    Имя из Zoom (``Ilya``, ``Vadim``) такому шаблону не соответствует — его можно наследовать
+    доминирующему говорящему при сплите общего микрофона. Пустое имя наследовать нечего.
+    """
+    cleaned = (name or "").strip()
+    if not cleaned:
+        return True
+    return bool(_PLACEHOLDER_SPEAKER_RE.match(cleaned))
+
+
 def build_per_track_segments(
     tracks: list[TrackSpec],
     *,
@@ -351,7 +370,13 @@ def build_per_track_segments(
         if len(substantial) >= 2:
             # Общий микрофон: оставляем только заметных говорящих, сквозная нумерация
             # по порядку появления (без дыр, даже если шумовой кластер выкинут).
+            # Доминирующий по talk-time кластер наследует Zoom-имя дорожки (владелец
+            # микрофона), остальные нумеруются Speaker N. Служебное имя дорожки не
+            # наследуем — тогда нумеруются все.
             renumber: dict[str, str] = {}
+            if not _is_placeholder_speaker(track.speaker):
+                dominant = max(substantial, key=lambda sp: (talk[sp], sp))
+                renumber[dominant] = track.speaker
             for segment in diarized:
                 if segment.speaker not in substantial:
                     continue

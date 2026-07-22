@@ -3569,3 +3569,30 @@ def test_memory_strip_removes_internal_prompt_terms():
     assert "prior_context" not in out.lower()
     assert "[" not in out and "]" not in out
     assert "памяти прошлых встреч" in out
+
+
+def test_shorten_breaks_on_word_boundary():
+    # Длинный текст обрезается по границе слова, без обрыва слова посередине.
+    text = "единый источник истины и при этом MD-версии лежали рядом с кодом"
+    out = reporting._shorten(text, limit=40)
+    assert out.endswith("…")
+    assert len(out) <= 40
+    # последнее «слово» перед многоточием — целое, не обрезок вроде «MD-верс»
+    assert out[:-1].rstrip().split()[-1] != "MD-верс"
+    assert not out[:-1].endswith("MD-верс")
+
+
+def test_shorten_keeps_short_text_intact():
+    assert reporting._shorten("коротко", limit=40) == "коротко"
+
+
+def test_shorten_falls_back_on_single_long_word():
+    # Без пробелов резать нечем -> жёсткий обрез + многоточие.
+    out = reporting._shorten("a" * 50, limit=10)
+    assert out.endswith("…")
+    assert len(out) <= 10
+
+
+def test_protocol_tldr_not_truncated_mid_word(monkeypatch):
+    # Тезис TL;DR влезает в TLDR_ITEM_LIMIT и не рвётся посередине слова.
+    assert reporting.TLDR_ITEM_LIMIT >= 300

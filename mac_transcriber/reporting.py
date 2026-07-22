@@ -86,6 +86,9 @@ MEMORY_SECTION_KINDS = {
 }
 COVERAGE_STATUSES = {"covered", "supporting", "low_signal"}
 LOCAL_REPORT_ITEM_LIMIT = 12
+# Максимальная длина тезиса TL;DR («Главное») в symbol-ах. Многооборотные русские тезисы
+# не влезали в прежние 230 и обрывались — 320 даёт полную мысль при обрезке по слову.
+TLDR_ITEM_LIMIT = 320
 AI_DIRECT_SEGMENT_LIMIT = int(
     os.environ.get("MAC_TRANSCRIBER_AI_DIRECT_SEGMENT_LIMIT", "180")
 )
@@ -2507,7 +2510,7 @@ def render_slack_summary(
         lines.append("*Проверить:* " + "; ".join(alerts[:3]))
     lines.extend(["", "*Главное:*"])
     for item in protocol.get("tldr", [])[:4]:
-        lines.append(f"• {_shorten(str(item), limit=260)}")
+        lines.append(f"• {_shorten(str(item), limit=TLDR_ITEM_LIMIT)}")
     lines.extend(["", "*Файлы:*"])
     for file_info in files:
         lines.append(
@@ -2784,13 +2787,13 @@ def _protocol_tldr(report: MeetingReport) -> list[str]:
             "recommendations",
         }:
             for item in section.items:
-                points.append(_shorten(item.text, limit=230))
+                points.append(_shorten(item.text, limit=TLDR_ITEM_LIMIT))
                 if len(points) >= 4:
                     return points
     for sentence in re.split(r"(?<=[.!?])\s+", report.overview):
         clean = sentence.strip()
         if clean:
-            points.append(_shorten(clean, limit=230))
+            points.append(_shorten(clean, limit=TLDR_ITEM_LIMIT))
         if len(points) >= 4:
             break
     return points or ["Содержательные тезисы не выделены; смотрите полный транскрипт."]
@@ -4251,7 +4254,11 @@ def _shorten(text: str, *, limit: int) -> str:
     clean = " ".join(text.split())
     if len(clean) <= limit:
         return clean
-    return clean[: limit - 1].rstrip() + "…"
+    # Режем по границе слова, чтобы не обрывать слово посередине («…MD-верс…»).
+    cut = clean[: limit - 1].rstrip()
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0].rstrip(" ,;:—–-") or cut
+    return cut + "…"
 
 
 def _coverage_counts(entries: list[CoverageEntry]) -> dict[str, int]:
