@@ -1,0 +1,38 @@
+stages:
+  - test
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_ROOT_USER_ACTION: "ignore"
+
+cache:
+  key:
+    files:
+      - pyproject.toml
+      - mac_transcriber/requirements.txt
+  paths:
+    - .cache/pip/
+
+mac-transcriber-tests:
+  stage: test
+  image: python:3.12-slim
+  interruptible: true
+  timeout: 45m
+  before_script:
+    - apt-get update -qq
+    - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg libsndfile1
+    - python -m pip install --upgrade pip setuptools wheel
+    - python -m pip install -e ".[tests]" -r mac_transcriber/requirements.txt
+  script:
+    - PYTHONPATH=. python -m pytest -q --junitxml=mac-transcriber-junit.xml mac_transcriber/tests
+    - python -m compileall -q mac_transcriber
+    - bash -n mac_transcriber/scripts/install_launchd.sh mac_transcriber/scripts/start_tunnel.sh
+  artifacts:
+    when: always
+    reports:
+      junit: mac-transcriber-junit.xml
+    expire_in: 7 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
