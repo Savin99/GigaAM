@@ -61,6 +61,15 @@ require_command() {
   fi
 }
 
+set_env_var() {
+  local target_path="$1"
+  local key="$2"
+  local value="$3"
+
+  "$plistbuddy_bin" -c "Set :EnvironmentVariables:$key $value" "$target_path" >/dev/null 2>&1 \
+    || "$plistbuddy_bin" -c "Add :EnvironmentVariables:$key string $value" "$target_path"
+}
+
 write_plist() {
   local plist_name="$1"
   local label="$2"
@@ -111,22 +120,13 @@ write_plist() {
       local tunnel_identity_file="${MAC_TRANSCRIBER_TUNNEL_IDENTITY_FILE:-$HOME/.ssh/valamis_vps_ed25519}"
       local tunnel_remote_forward="${MAC_TRANSCRIBER_TUNNEL_REMOTE_FORWARD:-127.0.0.1:18013:127.0.0.1:18003}"
       local tunnel_target="${MAC_TRANSCRIBER_TUNNEL_TARGET:-root@193.233.87.211}"
-      local tunnel_args=(
-        "/usr/bin/ssh"
-        "-N"
-        "-o" "BatchMode=yes"
-        "-o" "ExitOnForwardFailure=yes"
-        "-o" "ServerAliveInterval=30"
-        "-o" "ServerAliveCountMax=3"
-        "-o" "StrictHostKeyChecking=accept-new"
-      )
-      if [[ -f "$tunnel_identity_file" ]]; then
-        tunnel_args+=("-i" "$tunnel_identity_file" "-o" "IdentitiesOnly=yes")
-      fi
-      tunnel_args+=("-R" "$tunnel_remote_forward" "$tunnel_target")
+      local tunnel_args=("$repo_root/mac_transcriber/scripts/start_tunnel.sh")
       for arg_index in "${!tunnel_args[@]}"; do
         "$plistbuddy_bin" -c "Add :ProgramArguments:$arg_index string ${tunnel_args[$arg_index]}" "$target_path"
       done
+      set_env_var "$target_path" "MAC_TRANSCRIBER_TUNNEL_IDENTITY_FILE" "$tunnel_identity_file"
+      set_env_var "$target_path" "MAC_TRANSCRIBER_TUNNEL_REMOTE_FORWARD" "$tunnel_remote_forward"
+      set_env_var "$target_path" "MAC_TRANSCRIBER_TUNNEL_TARGET" "$tunnel_target"
       "$plutil_bin" -replace StandardOutPath -string "$log_dir/gigaam-tunnel.out.log" "$target_path"
       "$plutil_bin" -replace StandardErrorPath -string "$log_dir/gigaam-tunnel.err.log" "$target_path"
       ;;
@@ -164,6 +164,7 @@ reload_agent() {
 
   "$launchctl_bin" bootout "$service" >/dev/null 2>&1 || true
   "$launchctl_bin" bootout "$domain" "$target_path" >/dev/null 2>&1 || true
+  "$launchctl_bin" enable "$service" >/dev/null 2>&1 || true
   "$launchctl_bin" bootstrap "$domain" "$target_path"
   "$launchctl_bin" kickstart -k "$service"
   echo "Installed and started $label"

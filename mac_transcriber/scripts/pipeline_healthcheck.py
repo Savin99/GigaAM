@@ -9,7 +9,9 @@ heartbeat на внешний монитор (Uptime Kuma / Healthchecks / ntfy 
 Проверки:
   1. транскрайбер /healthz отвечает {"status":"ok"};
   2. нет встреч, застрявших в blocked_* дольше N часов (claude сломан/лимит/разлогин/кап);
-  3. claude CLI отвечает на --version (нужен дренажу).
+  3. claude CLI отвечает на --version, а в claude-backend режиме ещё и на
+     короткий headless prompt (нужен дренажу).
+  4. опционально: relay на VPS реально достаёт Mac через reverse SSH tunnel.
 
 ENV (в .env.local):
   MAC_TRANSCRIBER_HEALTHCHECK_URL       push-URL монитора (без него — no-op).
@@ -17,6 +19,17 @@ ENV (в .env.local):
                                         Если не задан — шлём на основной URL ?status=down.
   MAC_TRANSCRIBER_HEALTHCHECK_STUCK_HOURS  порог «застряло» (по умолч. 3).
   MAC_TRANSCRIBER_PORT                  порт транскрайбера (по умолч. 18003).
+  MAC_TRANSCRIBER_RELAY_HEALTHCHECK     1/true/yes — проверять VPS relay.
+  MAC_TRANSCRIBER_RELAY_URL             URL relay на VPS (по умолч.
+                                        http://127.0.0.1:18013/healthz).
+  MAC_TRANSCRIBER_TUNNEL_TARGET         SSH target VPS (по умолч.
+                                        root@193.233.87.211).
+  MAC_TRANSCRIBER_TUNNEL_IDENTITY_FILE  SSH key для VPS.
+  MAC_TRANSCRIBER_CLAUDE_PROMPT_HEALTHCHECK
+                                        1/true/yes — проверять claude -p даже
+                                        если backend не claude.
+  MAC_TRANSCRIBER_CLAUDE_HEALTHCHECK_ATTEMPTS
+                                        число попыток claude -p (по умолч. 2).
 """
 
 from __future__ import annotations
@@ -106,7 +119,71 @@ def check_claude() -> tuple[bool, str]:
         return False, f"claude --version error: {exc}"[:80]
     if res.returncode != 0:
         return False, f"claude --version rc={res.returncode}"
-    return True, f"claude {res.stdout.strip()[:30]}"
+    version_msg = f"claude {res.stdout.strip()[:30]}"
+    backend = (os.environ.get("MAC_TRANSCRIBER_REPORT_BACKEND") or "").strip().lower()
+    if backend != "claude" and not _env_truthy("MAC_TRANSCRIBER_CLAUDE_PROMPT_HEALTHCHECK"):
+        return True, version_msg
+
+    prompt_cmd = [claude, "-p", "ping", "--output-format", "json"]
+    timeout = int(os.environ.get("MAC_TRANSCRIBER_CLAUDE_HEALTHCHECK_TIMEOUT", "60"))
+    attempts = max(
+        1, int(os.environ.get("MAC_TRANSCRIBER_CLAUDE_HEALTHCHECK_ATTEMPTS", "2"))
+    )
+    last_error = ""
+    for _attempt in range(attempts):
+        try:
+            prompt = subprocess.run(
+                prompt_cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            last_error = f"claude prompt timeout after {timeout}s"
+            continue
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"claude prompt error: {type(exc).__name__}: {exc}"[:100]
+            continue
+        if prompt.returncode == 0:
+            return True, f"{version_msg}; prompt ok"
+        tail = ((prompt.stdout or "") + " " + (prompt.stderr or "")).strip()
+        last_error = f"claude prompt rc={prompt.returncode}: {tail[-100:]}"
+    return False, last_error
+
+
+def check_relay() -> tuple[bool, str]:
+    """Проверить relay с точки зрения VPS, а не локального Mac."""
+    target = os.environ.get("MAC_TRANSCRIBER_TUNNEL_TARGET", "root@193.233.87.211")
+    relay_url = os.environ.get(
+        "MAC_TRANSCRIBER_RELAY_URL", "http://127.0.0.1:18013/healthz"
+    )
+    identity = os.environ.get(
+        "MAC_TRANSCRIBER_TUNNEL_IDENTITY_FILE",
+        str(Path.home() / ".ssh" / "valamis_vps_ed25519"),
+    )
+    command = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=8",
+    ]
+    if identity and Path(identity).exists():
+        command += ["-i", identity, "-o", "IdentitiesOnly=yes"]
+    command += [target, f"curl -fsS -m8 {relay_url!r}"]
+
+    try:
+        res = subprocess.run(command, capture_output=True, text=True, timeout=20)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"relay unreachable: {exc}"[:100]
+    body = (res.stdout or "") + (res.stderr or "")
+    if res.returncode == 0 and '"ok"' in res.stdout:
+        return True, "relay ok"
+    return False, f"relay bad: rc={res.returncode} {body.strip()[:80]}"
+
+
+def _env_truthy(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def run_checks(now: datetime) -> tuple[bool, list[str]]:
@@ -116,6 +193,11 @@ def run_checks(now: datetime) -> tuple[bool, list[str]]:
     h_ok, h_msg = check_healthz(int(os.environ.get("MAC_TRANSCRIBER_PORT", "18003")))
     lines.append(h_msg)
     ok = ok and h_ok
+
+    if _env_truthy("MAC_TRANSCRIBER_RELAY_HEALTHCHECK"):
+        r_ok, r_msg = check_relay()
+        lines.append(r_msg)
+        ok = ok and r_ok
 
     max_hours = float(os.environ.get("MAC_TRANSCRIBER_HEALTHCHECK_STUCK_HOURS", "3"))
     stuck = blocked_too_long(_meetings_root(), max_hours, now)

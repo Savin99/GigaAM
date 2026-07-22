@@ -6,6 +6,7 @@ scripts/ не пакет — грузим модуль по пути (как в 
 
 import importlib.util
 import json
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -61,14 +62,106 @@ def test_run_checks_fails_when_stuck(tmp_path, monkeypatch):
     assert any("stuck blocked" in ln for ln in lines)
 
 
+def test_run_checks_fails_when_relay_unreachable(tmp_path, monkeypatch):
+    root = tmp_path / "meetings"
+    root.mkdir()
+    monkeypatch.setattr(hc, "_meetings_root", lambda: root)
+    monkeypatch.setattr(hc, "check_healthz", lambda port: (True, "healthz ok"))
+    monkeypatch.setattr(hc, "check_relay", lambda: (False, "relay unreachable"))
+    monkeypatch.setattr(hc, "check_claude", lambda: (True, "claude 2.1.169"))
+    monkeypatch.setenv("MAC_TRANSCRIBER_RELAY_HEALTHCHECK", "1")
+
+    ok, lines = hc.run_checks(NOW)
+    assert ok is False
+    assert "relay unreachable" in lines
+
+
 def test_run_checks_ok_when_healthy(tmp_path, monkeypatch):
     root = tmp_path / "meetings"
     root.mkdir()
     _meeting(root, "done", "completed", NOW.isoformat())
     monkeypatch.setattr(hc, "_meetings_root", lambda: root)
     monkeypatch.setattr(hc, "check_healthz", lambda port: (True, "healthz ok"))
+    monkeypatch.setattr(hc, "check_relay", lambda: (True, "relay ok"))
     monkeypatch.setattr(hc, "check_claude", lambda: (True, "claude 2.1.169"))
 
     ok, lines = hc.run_checks(NOW)
     assert ok is True
     assert any("queue ok" in ln for ln in lines)
+
+
+def test_check_claude_version_only_when_backend_not_claude(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="2.1.186\n", stderr="")
+
+    monkeypatch.setattr(hc.shutil, "which", lambda name: "/usr/local/bin/claude")
+    monkeypatch.setattr(hc.subprocess, "run", fake_run)
+    monkeypatch.delenv("MAC_TRANSCRIBER_REPORT_BACKEND", raising=False)
+    monkeypatch.delenv("MAC_TRANSCRIBER_CLAUDE_PROMPT_HEALTHCHECK", raising=False)
+
+    ok, msg = hc.check_claude()
+
+    assert ok is True
+    assert msg == "claude 2.1.186"
+    assert calls == [["/usr/local/bin/claude", "--version"]]
+
+
+def test_check_claude_prompt_required_for_claude_backend(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[1] == "--version":
+            return subprocess.CompletedProcess(cmd, 0, stdout="2.1.186\n", stderr="")
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout="", stderr="API Error: 401 Invalid authentication credentials"
+        )
+
+    monkeypatch.setattr(hc.shutil, "which", lambda name: "/usr/local/bin/claude")
+    monkeypatch.setattr(hc.subprocess, "run", fake_run)
+    monkeypatch.setenv("MAC_TRANSCRIBER_REPORT_BACKEND", "claude")
+    monkeypatch.setenv("MAC_TRANSCRIBER_CLAUDE_HEALTHCHECK_ATTEMPTS", "1")
+
+    ok, msg = hc.check_claude()
+
+    assert ok is False
+    assert "claude prompt rc=1" in msg
+    assert calls == [
+        ["/usr/local/bin/claude", "--version"],
+        ["/usr/local/bin/claude", "-p", "ping", "--output-format", "json"],
+    ]
+
+
+def test_check_claude_retries_transient_prompt_timeout(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[1] == "--version":
+            return subprocess.CompletedProcess(cmd, 0, stdout="2.1.186\n", stderr="")
+        if len([call for call in calls if call[1] == "-p"]) == 1:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=60)
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout='{"type":"result","is_error":false,"result":"pong"}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr(hc.shutil, "which", lambda name: "/usr/local/bin/claude")
+    monkeypatch.setattr(hc.subprocess, "run", fake_run)
+    monkeypatch.setenv("MAC_TRANSCRIBER_REPORT_BACKEND", "claude")
+    monkeypatch.setenv("MAC_TRANSCRIBER_CLAUDE_HEALTHCHECK_ATTEMPTS", "2")
+
+    ok, msg = hc.check_claude()
+
+    assert ok is True
+    assert msg == "claude 2.1.186; prompt ok"
+    assert calls == [
+        ["/usr/local/bin/claude", "--version"],
+        ["/usr/local/bin/claude", "-p", "ping", "--output-format", "json"],
+        ["/usr/local/bin/claude", "-p", "ping", "--output-format", "json"],
+    ]
