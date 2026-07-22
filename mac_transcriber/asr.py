@@ -5,7 +5,10 @@ import math
 import os
 import re
 import subprocess
+import tempfile
 import time
+import urllib.error
+import wave
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -884,6 +887,22 @@ def transcribe_segments(
     if not segments:
         return []
     model = load_model(model_name=model_name, cache_dir=cache_dir, device=device)
+    if hasattr(model, "transcribe") and not hasattr(model, "forward"):
+        total = len(segments)
+        for index, segment in enumerate(segments, start=1):
+            if segment.wav is None:
+                continue
+            wav_path, cleanup = _as_wav_path(segment.wav)
+            try:
+                text = model.transcribe(wav_path)
+            finally:
+                cleanup()
+            segment.text = apply_glossary(normalize_text(text))
+            segment.wav = None
+            if progress_callback is not None:
+                progress_callback(index, total)
+        return dedupe_segments(segments)
+
     dataset = AudioDataset(
         [segment.wav for segment in segments if segment.wav is not None]
     )
@@ -911,15 +930,68 @@ def transcribe_segments(
     return dedupe_segments(segments)
 
 
+def _as_wav_path(value: object) -> tuple[str, Callable[[], None]]:
+    if isinstance(value, (str, Path)):
+        return str(value), lambda: None
+    if isinstance(value, torch.Tensor):
+        fd, path = tempfile.mkstemp(suffix=".wav", prefix="mac-transcriber-segment-")
+        os.close(fd)
+        wav = value.detach().float().cpu().clamp(-1.0, 1.0)
+        pcm = (wav * 32767.0).to(torch.int16).numpy().tobytes()
+        with wave.open(path, "wb") as out:
+            out.setnchannels(1)
+            out.setsampwidth(2)
+            out.setframerate(SR)
+            out.writeframes(pcm)
+        return path, lambda: Path(path).unlink(missing_ok=True)
+    raise TypeError(f"Unsupported segment wav type: {type(value)}")
+
+
 def load_model(*, model_name: str, cache_dir: str, device: str):
     global _MODEL
     with _MODEL_LOCK:
         if _MODEL is None:
-            _MODEL = gigaam.load_model(
-                model_name, download_root=cache_dir, device=device
-            )
+            try:
+                _MODEL = gigaam.load_model(
+                    model_name, download_root=cache_dir, device=device
+                )
+            except urllib.error.HTTPError as exc:
+                if exc.code != 403:
+                    raise
+                _MODEL = load_hf_model(model_name=model_name, device=device)
             _MODEL.eval()
         return _MODEL
+
+
+class HFTranscribeModel:
+    def __init__(self, model):
+        self.model = model
+
+    def eval(self):
+        self.model.eval()
+        return self
+
+    def transcribe(self, wav_file: str) -> str:
+        return self.model.transcribe(wav_file)
+
+
+def load_hf_model(*, model_name: str, device: str) -> HFTranscribeModel:
+    try:
+        from transformers import AutoModel
+    except ImportError as exc:
+        raise RuntimeError(
+            "GigaAM CDN returned 403 and transformers is not installed for HF fallback"
+        ) from exc
+
+    revision = model_name.removeprefix("v3_")
+    model = AutoModel.from_pretrained(
+        "ai-sage/GigaAM-v3",
+        revision=revision,
+        trust_remote_code=True,
+    )
+    if hasattr(model, "to"):
+        model = model.to(device)
+    return HFTranscribeModel(model)
 
 
 def normalize_text(text: str) -> str:

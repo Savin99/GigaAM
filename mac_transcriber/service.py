@@ -3,9 +3,11 @@ import os
 import shutil
 import traceback
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from typing import Annotated
 
 from fastapi import (
@@ -70,7 +72,25 @@ ARTIFACTS = {
     ),
 }
 
-app = FastAPI(title="GigaAM Mac Transcriber")
+@asynccontextmanager
+async def app_lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    if os.environ.get("MAC_TRANSCRIBER_RESUME_ON_STARTUP", "1").lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        yield
+        return
+    Thread(
+        target=_resume_interrupted_meetings,
+        name="resume-interrupted-meetings",
+        daemon=True,
+    ).start()
+    yield
+
+
+app = FastAPI(title="GigaAM Mac Transcriber", lifespan=app_lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -314,6 +334,26 @@ def _process_meeting(meeting_id: str) -> None:
                 error=str(exc),
                 traceback=traceback.format_exc(),
             )
+
+
+def _interrupted_meeting_ids() -> list[str]:
+    meetings_dir = ROOT / "meetings"
+    if not meetings_dir.exists():
+        return []
+    meeting_ids: list[str] = []
+    for meeting_dir in sorted(path for path in meetings_dir.iterdir() if path.is_dir()):
+        status = _read_status(meeting_dir)
+        if status.get("status") not in {"uploaded", "processing"}:
+            continue
+        if not (meeting_dir / "input" / "audio.m4a").exists():
+            continue
+        meeting_ids.append(meeting_dir.name)
+    return meeting_ids
+
+
+def _resume_interrupted_meetings() -> None:
+    for meeting_id in _interrupted_meeting_ids():
+        _process_meeting(meeting_id)
 
 
 def _write_status(meeting_dir: Path, status: str, **extra: object) -> None:

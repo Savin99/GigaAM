@@ -1,3 +1,4 @@
+import asyncio
 import json
 import uuid
 
@@ -42,6 +43,64 @@ def test_process_meeting_queues_when_ai_unavailable(tmp_path, monkeypatch):
     # API недоступен -> очередь, а не failed/completed; сырой local-отчёт не пишется.
     assert status["status"] == "blocked_on_ai"
     assert not (meeting_dir / "artifacts" / "report.md").exists()
+
+
+def test_interrupted_meeting_ids_include_uploaded_and_processing_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(service, "ROOT", tmp_path)
+    meetings = tmp_path / "meetings"
+    for meeting_id, status in [
+        ("uploaded", "uploaded"),
+        ("processing", "processing"),
+        ("completed", "completed"),
+        ("failed", "failed"),
+        ("blocked", "blocked_on_ai"),
+    ]:
+        meeting_dir = meetings / meeting_id
+        (meeting_dir / "input").mkdir(parents=True)
+        (meeting_dir / "input" / "audio.m4a").write_bytes(b"audio")
+        (meeting_dir / "status.json").write_text(
+            json.dumps({"status": status}), encoding="utf-8"
+        )
+
+    assert service._interrupted_meeting_ids() == ["processing", "uploaded"]
+
+
+def test_app_lifespan_starts_resume_worker(monkeypatch):
+    started = []
+
+    class FakeThread:
+        def __init__(self, *, target, name, daemon):
+            assert target is service._resume_interrupted_meetings
+            assert name == "resume-interrupted-meetings"
+            assert daemon is True
+
+        def start(self):
+            started.append(True)
+
+    monkeypatch.delenv("MAC_TRANSCRIBER_RESUME_ON_STARTUP", raising=False)
+    monkeypatch.setattr(service, "Thread", FakeThread)
+
+    async def run_lifespan():
+        async with service.app_lifespan(service.app):
+            pass
+
+    asyncio.run(run_lifespan())
+    assert started == [True]
+
+
+def test_app_lifespan_can_disable_resume_worker(monkeypatch):
+    monkeypatch.setenv("MAC_TRANSCRIBER_RESUME_ON_STARTUP", "0")
+
+    def fail_thread(**_kwargs):
+        raise AssertionError("resume worker must stay disabled")
+
+    monkeypatch.setattr(service, "Thread", fail_thread)
+
+    async def run_lifespan():
+        async with service.app_lifespan(service.app):
+            pass
+
+    asyncio.run(run_lifespan())
 
 
 def test_regenerate_report_from_transcript_skips_asr(tmp_path, monkeypatch):
@@ -126,6 +185,42 @@ def test_regenerate_report_from_transcript_skips_asr(tmp_path, monkeypatch):
         (mdir / "artifacts" / "transcript.json").read_text(encoding="utf-8")
     )
     assert transcript[0]["segment_id"] == "S0001"
+
+
+def test_transcribe_segments_supports_transcribe_only_model(tmp_path, monkeypatch):
+    from mac_transcriber import asr
+
+    wav = tmp_path / "segment.wav"
+    wav.write_bytes(b"fake")
+    segment = asr.Segment(
+        start=0.0,
+        end=1.0,
+        speaker="SPEAKER_00",
+        track="audio.m4a",
+        wav=wav,
+    )
+
+    class TranscribeOnlyModel:
+        def transcribe(self, path):
+            assert path == str(wav)
+            return "  Проверка   fallback. "
+
+    monkeypatch.setattr(
+        asr,
+        "load_model",
+        lambda *, model_name, cache_dir, device: TranscribeOnlyModel(),
+    )
+
+    result = asr.transcribe_segments(
+        [segment],
+        model_name="v3_e2e_rnnt",
+        cache_dir="/tmp/cache",
+        device="cpu",
+        batch_size=4,
+    )
+
+    assert result[0].text == "Проверка fallback."
+    assert result[0].wav is None
 
 
 def test_load_local_env_file_overrides_report_model(tmp_path, monkeypatch):
