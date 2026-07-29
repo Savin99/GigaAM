@@ -3598,6 +3598,35 @@ def test_shorten_falls_back_on_single_long_word():
     assert len(out) <= 10
 
 
-def test_protocol_tldr_not_truncated_mid_word(monkeypatch):
-    # Тезис TL;DR влезает в TLDR_ITEM_LIMIT и не рвётся посередине слова.
-    assert reporting.TLDR_ITEM_LIMIT >= 300
+def test_protocol_tldr_keeps_all_complete_sentences():
+    sentences = [
+        f"Тезис {index}: " + ("длинная содержательная формулировка " * 12).strip() + "."
+        for index in range(1, 8)
+    ]
+    report = types.SimpleNamespace(
+        adaptive_sections=[],
+        overview=" ".join(sentences),
+    )
+
+    assert reporting._protocol_tldr(report) == sentences
+
+
+def test_slack_summary_does_not_truncate_or_limit_tldr(tmp_path):
+    points = [
+        f"Тезис {index}: " + ("полная формулировка " * 24).strip() + "."
+        for index in range(1, 8)
+    ]
+
+    summary = reporting.render_slack_summary(
+        protocol={
+            "meeting": {"title": "Полный TL;DR"},
+            "participants": [],
+            "kpis": [],
+            "tldr": points,
+        },
+        health={"status": "ok", "alerts": []},
+        output_dir=tmp_path,
+        pdf_path=None,
+    )
+
+    assert all(f"• {point}" in summary for point in points)
