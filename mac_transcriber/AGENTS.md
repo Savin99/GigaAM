@@ -46,7 +46,7 @@ curl -fsS http://127.0.0.1:18003/healthz
 For end-to-end VPS checks:
 
 ```bash
-ssh root@193.233.87.211 'cd /root/projects/slack_zoom && docker compose exec -T worker python - <<'"'"'PY'"'"'
+ssh root@111.88.224.176 'cd /root/projects/slack_zoom && docker compose exec -T worker python - <<'"'"'PY'"'"'
 import os
 import urllib.error
 import urllib.request
@@ -81,7 +81,7 @@ authenticated fake meeting check returns `AUTH_STATUS_CHECK=404`.
 If the transcriber fails after a reboot, check in this order:
 
 1. `curl -fsS http://127.0.0.1:18003/healthz` on the Mac.
-2. `ssh root@193.233.87.211 'curl -fsS http://127.0.0.1:18013/healthz'`.
+2. `ssh root@111.88.224.176 'curl -fsS http://127.0.0.1:18013/healthz'`.
 3. `systemctl status slack-zoom-mac-transcriber-relay.service` on the VPS.
 4. Worker container access to `http://host.docker.internal:18004/healthz`.
 5. `tail -n 100 ~/Library/Logs/slack_zoom/gigaam-transcriber.err.log`; if the error is

@@ -127,6 +127,9 @@ write_plist() {
       set_env_var "$target_path" "MAC_TRANSCRIBER_TUNNEL_IDENTITY_FILE" "$tunnel_identity_file"
       set_env_var "$target_path" "MAC_TRANSCRIBER_TUNNEL_REMOTE_FORWARD" "$tunnel_remote_forward"
       set_env_var "$target_path" "MAC_TRANSCRIBER_TUNNEL_TARGET" "$tunnel_target"
+      if [[ -n "${MAC_TRANSCRIBER_TUNNEL_BIND_INTERFACE:-}" ]]; then
+        set_env_var "$target_path" "MAC_TRANSCRIBER_TUNNEL_BIND_INTERFACE" "$MAC_TRANSCRIBER_TUNNEL_BIND_INTERFACE"
+      fi
       "$plutil_bin" -replace StandardOutPath -string "$log_dir/gigaam-tunnel.out.log" "$target_path"
       "$plutil_bin" -replace StandardErrorPath -string "$log_dir/gigaam-tunnel.err.log" "$target_path"
       ;;
@@ -177,7 +180,11 @@ require_command "$plistbuddy_bin" PlistBuddy
 shared_secret="${1:-${MAC_TRANSCRIBER_API_KEY:-}}"
 existing_transcriber_plist="$launch_agents_dir/com.slack-zoom.gigaam-transcriber.plist"
 if [[ -z "$shared_secret" && -f "$existing_transcriber_plist" ]]; then
-  shared_secret="$("$plistbuddy_bin" -c "Print :EnvironmentVariables:MAC_TRANSCRIBER_API_KEY" "$existing_transcriber_plist" 2>/dev/null || true)"
+  # PlistBuddy may print a parser error to stdout. Never use it as a credential.
+  if "$plutil_bin" -lint "$existing_transcriber_plist" >/dev/null 2>&1 \
+    && installed_secret="$("$plistbuddy_bin" -c "Print :EnvironmentVariables:MAC_TRANSCRIBER_API_KEY" "$existing_transcriber_plist" 2>/dev/null)"; then
+    shared_secret="$installed_secret"
+  fi
 fi
 if [[ -z "$shared_secret" || "$shared_secret" == "REPLACE_WITH_SHARED_SECRET" ]]; then
   echo "MAC_TRANSCRIBER_API_KEY, a shared-secret argument, or an existing installed secret is required." >&2
@@ -186,6 +193,14 @@ if [[ -z "$shared_secret" || "$shared_secret" == "REPLACE_WITH_SHARED_SECRET" ]]
 fi
 
 mkdir -p "$launch_agents_dir" "$log_dir"
+
+# Validate every template before overwriting any installed LaunchAgent.
+for plist_name in "${plists[@]}"; do
+  "$plutil_bin" -lint "$launchd_source_dir/$plist_name.example" >/dev/null || {
+    echo "Invalid launchd template: $plist_name.example" >&2
+    exit 65
+  }
+done
 
 for index in "${!plists[@]}"; do
   write_plist "${plists[$index]}" "${labels[$index]}"

@@ -112,6 +112,7 @@ def transcribe_meeting(
     device: str,
     batch_size: int,
     status_callback: Callable[..., None] | None = None,
+    include_report: bool = True,
 ) -> dict[str, object]:
     started = time.time()
     input_dir = meeting_dir / "input"
@@ -152,45 +153,65 @@ def transcribe_meeting(
             segments_total=segments_count,
         )
 
-    segments, tracks = build_input_segments(
-        input_dir=input_dir,
-        metadata=metadata,
-        device=device,
-        progress_callback=on_segmenting_progress,
-    )
-    _emit_progress(
-        status_callback,
-        "processing",
-        phase="transcribing",
-        progress=0.20 if segments else 0.82,
-        message="Transcribing speech segments"
-        if segments
-        else "No speech segments found",
-        segments_done=0,
-        segments_total=len(segments),
-        tracks_total=audio_track_count,
-    )
+    if model_name == "scribe_v2":
+        from mac_transcriber.scribe import transcribe_tracks
 
-    def on_segment_progress(done: int, total: int) -> None:
+        microphone_diagnostics = []
+        segments, tracks = transcribe_tracks(
+            tracks=tracks,
+            metadata=metadata,
+            cache_dir=meeting_dir / "scribe_cache",
+            diagnostics=microphone_diagnostics,
+            progress_callback=lambda done, total: _emit_progress(
+                status_callback,
+                "processing",
+                phase="transcribing",
+                progress=round(0.20 + 0.68 * done / max(total, 1), 3),
+                message="Transcribing with ElevenLabs Scribe v2",
+                tracks_done=done,
+                tracks_total=total,
+            ),
+        )
+    else:
+        segments, tracks = build_input_segments(
+            input_dir=input_dir,
+            metadata=metadata,
+            device=device,
+            progress_callback=on_segmenting_progress,
+        )
         _emit_progress(
             status_callback,
             "processing",
             phase="transcribing",
-            progress=round(0.20 + (0.68 * done / max(total, 1)), 3),
-            message="Transcribing speech segments",
-            segments_done=done,
-            segments_total=total,
+            progress=0.20 if segments else 0.82,
+            message="Transcribing speech segments"
+            if segments
+            else "No speech segments found",
+            segments_done=0,
+            segments_total=len(segments),
             tracks_total=audio_track_count,
         )
 
-    segments = transcribe_segments(
-        segments,
-        model_name=model_name,
-        cache_dir=cache_dir,
-        device=device,
-        batch_size=batch_size,
-        progress_callback=on_segment_progress,
-    )
+        def on_segment_progress(done: int, total: int) -> None:
+            _emit_progress(
+                status_callback,
+                "processing",
+                phase="transcribing",
+                progress=round(0.20 + (0.68 * done / max(total, 1)), 3),
+                message="Transcribing speech segments",
+                segments_done=done,
+                segments_total=total,
+                tracks_total=audio_track_count,
+            )
+
+        segments = transcribe_segments(
+            segments,
+            model_name=model_name,
+            cache_dir=cache_dir,
+            device=device,
+            batch_size=batch_size,
+            progress_callback=on_segment_progress,
+        )
     _emit_progress(
         status_callback,
         "processing",
@@ -201,6 +222,14 @@ def transcribe_meeting(
         segments_total=len(segments),
         tracks_total=audio_track_count,
     )
+    asr_metadata = {"model_name": model_name}
+    if model_name == "scribe_v2":
+        from mac_transcriber.scribe import meeting_keyterms
+        asr_metadata["microphones"] = microphone_diagnostics
+        asr_metadata["keyterms"] = meeting_keyterms(metadata)
+    (output_dir / "asr_metadata.json").write_text(
+        json.dumps(asr_metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
     write_artifacts(
         output_dir=output_dir,
         meeting_id=metadata.get("meeting_id") or meeting_dir.name,
@@ -210,6 +239,7 @@ def transcribe_meeting(
         tracks=tracks,
         segments=segments,
         elapsed_seconds=time.time() - started,
+        include_report=include_report,
     )
     result = {
         "segments": len(segments),
@@ -1034,6 +1064,7 @@ def write_artifacts(
     tracks: list[TrackSpec],
     segments: list[Segment],
     elapsed_seconds: float,
+    include_report: bool = True,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     ordered_segments = sorted(segments, key=lambda item: (item.start, item.end))
@@ -1075,6 +1106,41 @@ def write_artifacts(
     (output_dir / "speaker_track_map.tsv").write_text(
         render_track_map(tracks), encoding="utf-8"
     )
+
+    # Some callers, notably the ChatGPT audio bridge, need only the source
+    # transcript.  Do not invoke report generation, meeting-memory lookup, or
+    # embedding sync in that mode: those are separate workflows with different
+    # privacy and cost boundaries.
+    if not include_report:
+        (output_dir / "summary.json").write_text(
+            json.dumps(
+                {
+                    "meeting_id": meeting_id,
+                    "title": title,
+                    "source_filename": source_filename,
+                    "model_name": model_name,
+                    "summary": (
+                        f"Transcription completed: {len(segments)} segments, "
+                        f"{len(tracks)} tracks."
+                    ),
+                    "segments": len(segments),
+                    "tracks": len(tracks),
+                    "segment_count": len(segments),
+                    "track_count": len(tracks),
+                    "elapsed_seconds": round(elapsed_seconds, 3),
+                    "report_generator": "disabled",
+                    "report_status": "not_requested",
+                    "report_alerts": [],
+                    "slack": {"text": "", "files": []},
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return
+
     from mac_transcriber.reporting import write_report_artifacts
     from mac_transcriber.memory_db import (
         context_query_text,

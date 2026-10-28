@@ -37,6 +37,66 @@ The transcriber is not exposed publicly.
 
 ## Manual Run
 
+### ElevenLabs Scribe v2
+
+To replace local recognition and diarization, set these in the ignored `.env.local`
+at the repository root before restarting the transcriber LaunchAgent:
+
+```dotenv
+MAC_TRANSCRIBER_MODEL=scribe_v2
+ELEVENLABS_API_KEY=your-private-api-key
+```
+
+The service loads this file at startup. The default remains `v3_e2e_rnnt` until
+configured; rollback is setting `MAC_TRANSCRIBER_MODEL=v3_e2e_rnnt` and restarting
+the transcriber after the current meeting finishes. The tunnel and VPS need no changes.
+
+Scribe receives each complete input track using Russian, word timestamps, diarization,
+and verbatim text, with audio event tags disabled. Microphone mode is inferred independently for each meeting; sustained single
+voices use Zoom labels and shared microphones use connection / Speaker labels.
+See "Microphone modes and Scribe terminology" below for configuration.
+`metadata.terms_hint` (a list or comma/semicolon/newline-separated terms) is passed as
+validated `keyterms`. The existing glossary, artifact/report generation, PDF, and Slack
+contract remain in place. No automatic fallback to GigaAM occurs on API errors.
+
+Validated provider responses, including raw word timings, are saved under each
+meeting's `scribe_cache/`, outside the exposed artifact routes. Cache keys include
+the audio content and request options, avoiding another paid upload on retry.
+HTTP 429 is retried up to three attempts; ambiguous timeouts are reported rather than
+automatically resubmitted. Each participant track is a separate billable request.
+Audio is sent to ElevenLabs with its standard retention policy.
+
+Requests also have a `*.request.json` journal with timestamps, provider request ID
+(when received), and transport error type. An interrupted or ambiguous submission
+blocks another upload until an operator reconciles it with the provider. Preserve
+the journal as recovery evidence before explicitly clearing it for a retry.
+
+For uncertain cloud submissions, `MAC_TRANSCRIBER_SCRIBE_LOCAL_RECOVERY=1` enables
+recovery from validated Scribe caches plus local GigaAM for missing tracks. Set
+`MAC_TRANSCRIBER_LOCAL_MODEL_CACHE` to the existing GigaAM cache if needed (default
+`~/.cache/gigaam`). Recovery never submits more cloud ASR requests or downloads
+models. Each track has a resumable checkpoint and its engine is recorded in
+`asr_metadata.json`; local speaker labels identify Zoom connections. This option
+does not change the transcript-only ChatGPT bridge workflow.
+
+To recover one already failed meeting, run
+`.venv/bin/python mac_transcriber/scripts/recover_scribe_locally.py <meeting-dir> --publish`.
+Only a complete transcript is published and queued for the normal report. Keep the
+original audio, request journals, and `local_recovery/` checkpoints for the audit.
+
+The Scribe connection enables TCP keepalive during long requests. If VPN routing
+breaks the private SSH tunnel, `MAC_TRANSCRIBER_TUNNEL_BIND_INTERFACE=en1` in the
+tunnel LaunchAgent environment can bind SSH to the physical interface. Verify the
+interface and remote health before resuming jobs.
+
+After ASR recovery, generate a deferred report for just that meeting with
+`.venv/bin/python mac_transcriber/scripts/drain_reports_via_claude.py --meeting-id <id>`.
+This also restricts reuploads to the selected meeting.
+
+API reference: https://elevenlabs.io/docs/api-reference/speech-to-text/convert
+
+### Local GigaAM
+
 ```bash
 uv pip install --python .venv/bin/python -r mac_transcriber/requirements.txt
 export HF_TOKEN="hf_..."
@@ -226,6 +286,14 @@ curl -fsS -X POST "$TRANSCRIPTION_SERVICE_URL/meetings" \
   -F "processing_mode=simple"
 ```
 
+For a raw transcript without AI report, PDF, or meeting-memory enrichment, add the
+following form field. The ChatGPT MCP bridge uses this mode so personal dictaphone
+files remain separate from the reporting pipeline:
+
+```bash
+-F "transcript_only=true"
+```
+
 `title` is optional but recommended. If it is omitted, the service derives a display
 title from the uploaded filename and strips common Zoom date/time suffixes instead of
 using the internal UUID.
@@ -349,6 +417,7 @@ Supported artifacts:
 
 - `manifest_json`
 - `context_pack_json`
+- `youtrack_context_json`
 - `transcript_md`
 - `transcript_json`
 - `summary_json`
@@ -360,6 +429,33 @@ Supported artifacts:
 - `report_pdf`
 - `segments_tsv`
 - `speaker_track_map`
+
+### Read-only YouTrack reconciliation
+
+When the Claude report backend is used, the scheduled drain performs two additional
+bounded Opus passes before the final report. The first pass extracts transcript-cited
+search intents, Python retrieves real candidates through the local YouTrack MCP
+endpoint, and the second pass classifies candidate links as `confirmed`, `possible`,
+or `unmatched`. Python rejects invented issue IDs and segment citations.
+
+The durable snapshot is written to `youtrack_context.json`, included in the report
+artifacts, and uploaded with the report to Yandex Disk. YouTrack failure is fail-open:
+the report still completes and `report_health.json` records a degraded enrichment
+check. Only `search_issues` and `get_issue` are allowed; no tracker write operation is
+available to this pipeline.
+
+Credentials are read from `YOUTRACK_URL`/`YOUTRACK_TOKEN` when present, otherwise from
+the local `mcp_servers.youtrack.env` section in `~/.codex/config.toml`. They are never
+copied into prompts or artifacts. Optional controls:
+
+```env
+MAC_TRANSCRIBER_YOUTRACK_ENRICHMENT=1
+MAC_TRANSCRIBER_YOUTRACK_PROJECT=CH
+MAC_TRANSCRIBER_YOUTRACK_VERIFY_TLS=1
+MAC_TRANSCRIBER_YOUTRACK_TIMEOUT=20
+MAC_TRANSCRIBER_YOUTRACK_CLAUDE_TIMEOUT=600
+MAC_TRANSCRIBER_YOUTRACK_EFFORT=high
+```
 
 Slack message text is stored in `summary_json.slack.text`. Upload only the files
 listed in `summary_json.slack.files`.
@@ -470,13 +566,13 @@ launchctl list | rg 'com\.slack-zoom\.gigaam'
 VPS to Mac tunnel:
 
 ```bash
-ssh root@193.233.87.211 'curl -fsS http://127.0.0.1:18013/healthz'
+ssh root@111.88.224.176 'curl -fsS http://127.0.0.1:18013/healthz'
 ```
 
 `slack_zoom-worker` to Mac through the relay:
 
 ```bash
-ssh root@193.233.87.211 'cd /root/projects/slack_zoom && docker compose exec -T worker python - <<'"'"'PY'"'"'
+ssh root@111.88.224.176 'cd /root/projects/slack_zoom && docker compose exec -T worker python - <<'"'"'PY'"'"'
 import os
 import urllib.error
 import urllib.request
@@ -518,9 +614,43 @@ tail -n 100 ~/Library/Logs/slack_zoom/gigaam-tunnel.err.log
 Check VPS relay and ports:
 
 ```bash
-ssh root@193.233.87.211 'systemctl status slack-zoom-mac-transcriber-relay.service --no-pager'
-ssh root@193.233.87.211 'ss -ltnp | grep -E ":18013|:18004"'
+ssh root@111.88.224.176 'systemctl status slack-zoom-mac-transcriber-relay.service --no-pager'
+ssh root@111.88.224.176 'ss -ltnp | grep -E ":18013|:18004"'
 ```
 
 If the VPS reboots, `slack_zoom` containers should restart automatically with
 `restart=unless-stopped`, and the relay is enabled through systemd.
+
+### Microphone modes and Scribe terminology
+
+Scribe uses `scribe_keyterms.json` by default; per-meeting `terms_hint` is merged
+with it. Override the dictionary with `MAC_TRANSCRIBER_SCRIBE_KEYTERMS_FILE` (JSON
+list, `[]` disables defaults). Keyterms incur ElevenLabs' additional usage charge.
+
+`POST /meetings` accepts optional `terms_hint` and `microphone_mode` form fields.
+Each entry in `zoom_participant_tracks_json` can also include `microphone_mode`:
+
+- `single`: explicitly confirmed personal microphone. Request `num_speakers=1`
+  and retain the Zoom participant name, including brief utterances.
+- `room`: shared microphone. Keep all detected anonymous speakers, without a
+  duration threshold or assignment of the Zoom account's name to a voice.
+- `unknown`: keep anonymous labels; do not infer a person's identity.
+
+Mode priority: per-track metadata, explicit meeting mode, then `auto` (default).
+Saved mappings by Zoom name are no longer consulted, because rooms change.
+`auto` uses Scribe word timings: two IDs with at least 8 words and 3 seconds each,
+plus repeated turns or 10 seconds of speech, count as a shared microphone.
+A dominant ID needs at least 20 words and 8 seconds to inherit the Zoom name;
+secondary IDs must each have at most 2 words / 0.8 seconds and together at most
+1% of dominant speech. Their speech remains anonymous, never merged or dropped.
+Other cases remain unknown. Room labels are `Zoom connection / Speaker N`.
+These are conservative heuristics, not verified voice identities; real voices can
+be split or merged by Scribe. `asr_metadata_json` records the inferred mode,
+reason and per-ID statistics so thresholds can be audited on real recordings.
+
+New Claude reports require verbatim source evidence for formal decisions/tasks.
+Quotes must match every cited segment. Proposals are retained as open questions,
+not commitments. A failed evidence check gets one regeneration attempt and blocks
+publication if still invalid. This verifies provenance, not semantic entailment;
+the report author also checks meaning, owner, deadline and certainty. The complete
+citation set is rendered in decisions/tasks (previously only the first was shown).

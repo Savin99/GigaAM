@@ -7,10 +7,11 @@
 и для каждой:
 
   1. agent_report.prepare  : transcript.json -> agent_input.json (канонич. segment_id)
-  2. claude -p             : читает agent_input.json -> пишет ai_payload.json
-  3. agent_report.finalize : payload -> рендер report.{md,json,html,typ,pdf}+coverage+health+slack
-  4. upload_reports_to_yandex --meeting-dirs : заливка на Я.Диск ('<дата> <заголовок>')
-  5. service._write_status(completed)         : финализация (манифест/память) + VPS/Slack подхватит
+  2. YouTrack enrichment   : Opus intents -> read-only MCP -> Opus verification
+  3. claude -p             : читает agent_input.json -> пишет ai_payload.json
+  4. agent_report.finalize : payload -> рендер report.{md,json,html,typ,pdf}+coverage+health+slack
+  5. upload_reports_to_yandex --meeting-dirs : заливка на Я.Диск ('<дата> <заголовок>')
+  6. service._write_status(completed)         : финализация (манифест/память) + VPS/Slack подхватит
 
 Idle-дёшево: если очередь пуста — выходим ДО запуска claude (ноль токенов).
 Вешается на launchd (ежечасно). claude гоняется с --allowedTools 'Read Write Edit'
@@ -43,6 +44,9 @@ for p in (str(REPO_ROOT), str(SCRIPTS_DIR)):
 import reprocess_blocked as rb  # noqa: E402
 
 INSTRUCTIONS = SCRIPTS_DIR / "report_agent_instructions.md"
+YOUTRACK_INSTRUCTIONS = (
+    REPO_ROOT / "mac_transcriber" / "youtrack_agent_instructions.md"
+)
 UPLOAD_SCRIPT = SCRIPTS_DIR / "upload_reports_to_yandex.py"
 CLAUDE_TIMEOUT = int(os.environ.get("MAC_TRANSCRIBER_CLAUDE_TIMEOUT", "1500"))
 # Кросс-процессный лок: не даём двум дренажам наложиться (launchd + ручной запуск).
@@ -70,6 +74,13 @@ def _claude_bin() -> str:
         or shutil.which("claude")
         or str(Path.home() / ".local" / "bin" / "claude")
     )
+
+
+def _resolve_claude_model(cli_model: str | None) -> str:
+    """CLI-флаг приоритетнее модели из env, загруженного после argparse."""
+    if cli_model is not None:
+        return cli_model.strip()
+    return (os.environ.get("MAC_TRANSCRIBER_CLAUDE_MODEL") or "").strip()
 
 
 # Сигналы исчерпания лимитов / недоступности AI в выводе claude (для логов).
@@ -113,7 +124,7 @@ def _classify_generation(payload_valid: bool, payload_exists: bool) -> str:
     return "limit"
 
 
-def _generate_payload(work: Path, model: str) -> str:
+def _generate_payload(work: Path, model: str, *, evidence_retry: bool = True) -> str:
     """claude -p: читает agent_input.json -> пишет ai_payload.json. Возвращает ok|limit|fail."""
     out = work / "ai_payload.json"
     if out.exists():
@@ -124,6 +135,9 @@ def _generate_payload(work: Path, model: str) -> str:
         f"Сгенерируй подробный отчёт-payload строго по схеме из инструкций и запиши его "
         f"как валидный JSON через Write в {out}. Запиши ТОЛЬКО этот файл, ничего больше."
     )
+    feedback = work / "evidence_feedback.json"
+    if feedback.exists():
+        prompt += f" Сначала прочитай {feedback} и исправь указанные ошибки оснований."
     cmd = [
         _claude_bin(),
         "-p",
@@ -170,7 +184,216 @@ def _generate_payload(work: Path, model: str) -> str:
         print(f"   claude {reason}; tail: …{tail[-180:]}", flush=True)
     elif status == "fail":
         print(f"   payload невалиден (брак); tail: …{tail[-180:]}", flush=True)
+    if status == "ok":
+        from types import SimpleNamespace
+        from mac_transcriber.report_evidence import validate_payload
+        source_path = work / "agent_input.json"
+        source = json.loads(source_path.read_text()) if source_path.exists() else {}
+        if source.get("evidence_contract_version") == 1:
+            try:
+                validate_payload(json.loads(out.read_text()), [SimpleNamespace(**r) for r in source["segments"]])
+            except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                feedback.write_text(json.dumps({"error": str(exc)}, ensure_ascii=False), encoding="utf-8")
+                if evidence_retry:
+                    print("   source evidence invalid -> one repair attempt", flush=True)
+                    return _generate_payload(work, model, evidence_retry=False)
+                print("   source evidence invalid after repair -> fail", flush=True)
+                return "fail"
     return status
+
+
+def _json_object_has_key(path: Path, key: str) -> bool:
+    if not path.exists():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and isinstance(payload.get(key), list)
+
+
+def _run_youtrack_agent_pass(
+    *,
+    work: Path,
+    model: str,
+    mode: str,
+) -> str:
+    """Run one bounded Claude JSON pass for tracker reconciliation."""
+
+    if mode == "intents":
+        output = work / "youtrack_intents.json"
+        expected_key = "intents"
+        prompt = (
+            f"Прочитай инструкции {YOUTRACK_INSTRUCTIONS} ПОЛНОСТЬЮ. Выполни только "
+            f"«Проход 1: извлечение поисковых намерений»: прочитай "
+            f"{work / 'agent_input.json'} целиком и запиши валидный JSON в {output}. "
+            "Запиши только этот файл."
+        )
+    elif mode == "verification":
+        output = work / "youtrack_verification.json"
+        expected_key = "matches"
+        prompt = (
+            f"Прочитай инструкции {YOUTRACK_INSTRUCTIONS} ПОЛНОСТЬЮ. Выполни только "
+            f"«Проход 2: проверка кандидатов»: прочитай {work / 'agent_input.json'} "
+            f"и {work / 'youtrack_candidates.json'} целиком, затем запиши валидный "
+            f"JSON в {output}. Запиши только этот файл."
+        )
+    else:
+        raise ValueError(f"Unknown YouTrack agent pass: {mode}")
+
+    if output.exists():
+        output.unlink()
+    cmd = [
+        _claude_bin(),
+        "-p",
+        prompt,
+        "--allowedTools",
+        "Read Write Edit",
+        "--permission-mode",
+        "bypassPermissions",
+    ]
+    if model:
+        cmd += ["--model", model]
+    effort = (os.environ.get("MAC_TRANSCRIBER_YOUTRACK_EFFORT") or "high").strip()
+    if effort:
+        cmd += ["--effort", effort]
+    timeout = int(
+        os.environ.get(
+            "MAC_TRANSCRIBER_YOUTRACK_CLAUDE_TIMEOUT",
+            str(min(CLAUDE_TIMEOUT, 600)),
+        )
+    )
+    env = {**os.environ, "DISABLE_AUTOUPDATER": "1"}
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(REPO_ROOT),
+            timeout=timeout,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"   YouTrack {mode}: claude timeout (fail-open)", flush=True)
+        return "fail"
+
+    if _json_object_has_key(output, expected_key):
+        return "ok"
+    tail = ((result.stdout or "") + " " + (result.stderr or "")).strip()
+    status = "fail" if output.exists() else "unavailable"
+    print(
+        f"   YouTrack {mode}: {status} (fail-open); tail: …{tail[-180:]}",
+        flush=True,
+    )
+    return status
+
+
+def _youtrack_enabled() -> bool:
+    raw = os.environ.get("MAC_TRANSCRIBER_YOUTRACK_ENRICHMENT", "1")
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _prepare_youtrack_context(
+    *,
+    work: Path,
+    model: str,
+    enabled: bool = True,
+) -> dict:
+    """Build and inject fail-open ``youtrack_context`` into agent_input.json."""
+
+    from mac_transcriber import youtrack_enrichment as yt
+
+    generated_by = f"{model or 'claude-default'} · two-pass verifier"
+    agent_input_path = work / "agent_input.json"
+    agent_input = yt.read_json_object(agent_input_path)
+    if agent_input is None:
+        raise RuntimeError("agent_input.json is not a JSON object")
+
+    if not enabled or not _youtrack_enabled():
+        context = yt.empty_context(status="disabled", generated_by=generated_by)
+        yt.write_json(work / "youtrack_context.json", context)
+        yt.inject_context(agent_input_path, context)
+        return context
+
+    extra_errors: list[str] = []
+    try:
+        intent_status = _run_youtrack_agent_pass(
+            work=work,
+            model=model,
+            mode="intents",
+        )
+    except Exception as exc:  # noqa: BLE001 - enrichment must remain fail-open
+        intent_status = "fail"
+        extra_errors.append(
+            f"Claude intent extraction failed: {type(exc).__name__}."
+        )
+    intents = yt.read_json_object(work / "youtrack_intents.json") or {"intents": []}
+    if intent_status != "ok":
+        extra_errors.append(
+            f"Claude intent extraction is {intent_status}; exact issue IDs only."
+        )
+
+    try:
+        client = yt.YouTrackMcpClient.from_local_config()
+        candidates = yt.build_candidate_snapshot(
+            agent_input=agent_input,
+            model_intents=intents,
+            client=client,
+        )
+    except Exception as exc:  # noqa: BLE001 - enrichment must not block reports
+        context = yt.empty_context(
+            status="unavailable",
+            generated_by=generated_by,
+            error=f"YouTrack candidate retrieval failed: {type(exc).__name__}.",
+        )
+        context["errors"].extend(extra_errors)
+        yt.write_json(work / "youtrack_context.json", context)
+        yt.inject_context(agent_input_path, context)
+        print("   YouTrack MCP unavailable -> report continues", flush=True)
+        return context
+
+    yt.write_json(work / "youtrack_candidates.json", candidates)
+    verification: dict = {"matches": []}
+    if candidates.get("candidates"):
+        try:
+            verify_status = _run_youtrack_agent_pass(
+                work=work,
+                model=model,
+                mode="verification",
+            )
+        except Exception as exc:  # noqa: BLE001 - enrichment must remain fail-open
+            verify_status = "fail"
+            extra_errors.append(
+                f"Claude candidate verification failed: {type(exc).__name__}."
+            )
+        verification = (
+            yt.read_json_object(work / "youtrack_verification.json")
+            or {"matches": []}
+        )
+        if verify_status != "ok":
+            extra_errors.append(
+                f"Claude candidate verification is {verify_status}; no match confirmed."
+            )
+
+    context = yt.finalize_context(
+        candidate_snapshot=candidates,
+        verification=verification,
+        agent_input=agent_input,
+        generated_by=generated_by,
+        extra_errors=extra_errors,
+    )
+    yt.write_json(work / "youtrack_context.json", context)
+    yt.inject_context(agent_input_path, context)
+    print(
+        "   YouTrack: "
+        f"{len(context['confirmed'])} confirmed, "
+        f"{len(context['possible'])} possible, "
+        f"{len(context['unmatched'])} unmatched "
+        f"(status={context['status']})",
+        flush=True,
+    )
+    return context
 
 
 def _acquire_lock(lock_path: Path):
@@ -258,17 +481,22 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--env-file", type=Path, action="append", default=None)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--meeting-id", help="обработать только указанную сохранённую встречу")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-upload", action="store_true", help="не заливать на Я.Диск")
     ap.add_argument("--no-pdf", action="store_true")
     ap.add_argument(
-        "--model", default=os.environ.get("MAC_TRANSCRIBER_CLAUDE_MODEL", "")
+        "--no-youtrack",
+        action="store_true",
+        help="отключить read-only сверку транскрипта с YouTrack",
     )
+    ap.add_argument("--model", default=None)
     args = ap.parse_args(argv)
 
     _load_env_files(
         args.env_file if args.env_file is not None else [REPO_ROOT / ".env.local"]
     )
+    claude_model = _resolve_claude_model(args.model)
 
     # Кросс-процессный лок: не даём двум дренажам наложиться. При --dry-run ничего не
     # пишем, поэтому лок не нужен. Дескриптор держим открытым до конца процесса.
@@ -286,6 +514,9 @@ def main(argv: list[str] | None = None) -> int:
     meetings_root = service.ROOT / "meetings"
     blocked = rb._blocked_meetings(meetings_root)
     regen = rb._needs_regen_meetings(meetings_root, blocked)
+    if args.meeting_id:
+        blocked = [d for d in blocked if d.name == args.meeting_id]
+        regen = [d for d in regen if d.name == args.meeting_id]
     regen_set = {m.resolve() for m in regen}
     queue = blocked + regen
     if args.limit:
@@ -298,6 +529,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_upload:
         for status_path in meetings_root.glob("*/status.json"):
             md = status_path.parent
+            if args.meeting_id and md.name != args.meeting_id:
+                continue
             if md.resolve() in queue_set:
                 continue  # эти и так пройдут штатную поштучную заливку
             if rb._read_status(md).get("status") != "completed":
@@ -309,6 +542,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Nothing to do: queue empty.")  # idle: claude не запускаем
         return 0
 
+    print(f"Claude model: {claude_model or '(default)'}")
     print(
         f"{len(queue)} meeting(s): {len(blocked)} blocked, {len(regen)} stale "
         f"(oldest first); {len(reupload_only)} reupload-only"
@@ -327,7 +561,10 @@ def main(argv: list[str] | None = None) -> int:
     work_root = Path(tempfile.mkdtemp(prefix="claude_reports_"))
     try:
         for d in queue:
-            print(f"\n== {d.name}: prepare -> claude -> finalize", flush=True)
+            print(
+                f"\n== {d.name}: prepare -> YouTrack -> claude -> finalize",
+                flush=True,
+            )
             is_regen = d.resolve() in regen_set
             # Кап тратится ТОЛЬКО на детерминированные сбои (claude отработал, но дал брак;
             # finalize/health упали). Временный лимит счётчик НЕ трогает — см. ниже.
@@ -347,7 +584,12 @@ def main(argv: list[str] | None = None) -> int:
                 ar.cmd_prepare(
                     argparse.Namespace(meeting_dir=str(d), work_dir=str(work))
                 )
-                status = _generate_payload(work, args.model)
+                _prepare_youtrack_context(
+                    work=work,
+                    model=claude_model,
+                    enabled=not args.no_youtrack,
+                )
+                status = _generate_payload(work, claude_model)
             except Exception as exc:  # noqa: BLE001
                 print(f"   prepare/generate FAILED (left as-is): {exc}", flush=True)
                 _bump_fail()
@@ -376,6 +618,7 @@ def main(argv: list[str] | None = None) -> int:
                         meeting_dir=str(d),
                         work_dir=str(work),
                         out_dir=str(d / "artifacts"),
+                        report_model=claude_model,
                         pdf=not args.no_pdf,
                     )
                 )

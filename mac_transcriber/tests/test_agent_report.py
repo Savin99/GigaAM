@@ -143,12 +143,53 @@ def test_finalize_round_trip_filters_unknown_citations(tmp_path):
         json.dumps(ai_payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    (work_dir / "youtrack_context.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "source": "youtrack_mcp",
+                "project": "CH",
+                "status": "ok",
+                "fetched_at": "2026-07-27T12:00:00+00:00",
+                "generated_by": "claude-opus-5 · two-pass verifier",
+                "confirmed": [
+                    {
+                        "intent_id": "YT001",
+                        "issue": {
+                            "id": "CH-594",
+                            "summary": "Отдавать доп поля для фронта по документам",
+                            "url": "https://youtrack.example/issue/CH-594",
+                            "stage": "Develop",
+                            "state": "In Progress",
+                            "assignee": "George",
+                            "parent": None,
+                        },
+                        "decision": "confirmed",
+                        "signals": ["same_object", "same_action"],
+                        "conflicts": [],
+                        "segment_ids": [real_id],
+                        "rationale": "Совпали объект и действие.",
+                    }
+                ],
+                "possible": [],
+                "unmatched": [],
+                "candidate_count": 1,
+                "intent_count": 1,
+                "errors": [],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     rc = agent_report.cmd_finalize(
         argparse.Namespace(
             meeting_dir=str(meeting_dir),
             work_dir=str(work_dir),
             out_dir=str(out_dir),
+            report_model="claude-opus-5",
             pdf=False,
         )
     )
@@ -156,7 +197,13 @@ def test_finalize_round_trip_filters_unknown_citations(tmp_path):
     assert rc == 0
 
     # Артефакты на месте.
-    for name in ("report.md", "report.json", "coverage.json", "report_health.json"):
+    for name in (
+        "report.md",
+        "report.json",
+        "coverage.json",
+        "report_health.json",
+        "youtrack_context.json",
+    ):
         assert (out_dir / name).exists(), f"{name} was not written"
 
     report_json_text = (out_dir / "report.json").read_text(encoding="utf-8")
@@ -171,6 +218,11 @@ def test_finalize_round_trip_filters_unknown_citations(tmp_path):
     # Health собрался и не "failed".
     health = json.loads((out_dir / "report_health.json").read_text(encoding="utf-8"))
     assert health["status"] in ("ok", "degraded")
+    assert health["generated_by"] == "claude-opus-5 · mac_transcriber subagent"
+    assert health["youtrack_enrichment"]["confirmed"] == 1
+    checks = {check["name"]: check for check in health["checks"]}
+    assert checks["youtrack_enrichment"]["ok"] is True
+    assert checks["report_source_quotes"]["ok"] is True
 
     # Title из payload применился к отчёту.
     report_json = json.loads(report_json_text)
@@ -179,4 +231,14 @@ def test_finalize_round_trip_filters_unknown_citations(tmp_path):
     # И в Markdown заголовок тоже подхватился.
     assert "Планирование PDF-отчётов" in (out_dir / "report.md").read_text(
         encoding="utf-8"
+    )
+    assert "CH-594" in (out_dir / "report.md").read_text(encoding="utf-8")
+
+
+def test_generated_by_uses_env_when_model_not_explicit(monkeypatch):
+    monkeypatch.setenv("MAC_TRANSCRIBER_CLAUDE_MODEL", "claude-fable-5")
+
+    assert (
+        agent_report._generated_by()
+        == "claude-fable-5 · mac_transcriber subagent"
     )

@@ -164,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
         cache_dir=str(args.cache_dir.expanduser()),
         device=args.device,
         batch_size=args.batch_size,
+        allow_mixed_audio=args.allow_mixed_audio,
     )
     print(json.dumps(results, ensure_ascii=False, indent=2) + "\n")
     return 0
@@ -186,6 +187,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--download-only", action="store_true")
+    parser.add_argument(
+        "--allow-mixed-audio",
+        action="store_true",
+        help=(
+            "Explicitly allow recordings without Zoom participant tracks; "
+            "the mixed M4A is transcribed as a single unattributed speaker."
+        ),
+    )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--cache-dir", type=Path, default=Path(DEFAULT_CACHE_DIR))
     parser.add_argument("--device", default="cpu")
@@ -223,6 +232,7 @@ def backfill_zoom_recordings(
     cache_dir: str = DEFAULT_CACHE_DIR,
     device: str = "cpu",
     batch_size: int = 4,
+    allow_mixed_audio: bool = False,
 ) -> list[dict[str, object]]:
     client = ZoomClient(
         account_id=required_env(env, "ZOOM_ACCOUNT_ID"),
@@ -243,6 +253,17 @@ def backfill_zoom_recordings(
     for recording in recordings:
         meeting_id = zoom_meeting_id(recording)
         title = recording_title(recording)
+        meeting_dir = work_root / meeting_id
+        if not force and is_skipped_empty_recording(meeting_dir):
+            results.append(
+                {
+                    "meeting_id": meeting_id,
+                    "status": "skipped_empty",
+                    "title": title,
+                    "meeting_dir": str(meeting_dir),
+                }
+            )
+            continue
         if dry_run:
             results.append({"meeting_id": meeting_id, "status": "dry_run", "title": title})
             continue
@@ -253,6 +274,7 @@ def backfill_zoom_recordings(
                 client=client,
                 work_root=work_root,
                 force=force,
+                allow_mixed_audio=allow_mixed_audio,
             )
             if download_only:
                 results.append(
@@ -295,6 +317,7 @@ def prepare_meeting_dir(
     client: object,
     work_root: Path,
     force: bool,
+    allow_mixed_audio: bool = False,
 ) -> PreparedMeeting:
     meeting_id = zoom_meeting_id(recording)
     title = recording_title(recording)
@@ -313,11 +336,18 @@ def prepare_meeting_dir(
                     title=str(metadata.get("title") or title) if isinstance(metadata, dict) else title,
                     participant_tracks=len(tracks),
                 )
+            if allow_mixed_audio and valid_existing_mixed_audio(metadata, participant_files):
+                return PreparedMeeting(
+                    meeting_id=meeting_id,
+                    meeting_dir=meeting_dir,
+                    title=str(metadata.get("title") or title),
+                    participant_tracks=0,
+                )
         shutil.rmtree(meeting_dir)
     participants_dir.mkdir(parents=True, exist_ok=True)
 
     participant_files = participant_audio_files(recording)
-    if not participant_files:
+    if not participant_files and not allow_mixed_audio:
         raise ValueError("recording does not contain participant_audio_files")
     downloadable_participant_files = [
         participant_file for participant_file in participant_files if participant_file.get("download_url")
@@ -346,16 +376,17 @@ def prepare_meeting_dir(
             }
         )
 
+    mixed_audio = not participant_files
     metadata = {
         **sanitize_zoom_recording_metadata(recording),
         "meeting_id": meeting_id,
         "zoom_uuid": str(recording.get("uuid") or ""),
         "zoom_meeting_id": str(recording.get("id") or ""),
         "title": title,
-        "source": "zoom_cloud_backfill",
+        "source": "zoom_cloud_backfill_mixed" if mixed_audio else "zoom_cloud_backfill",
         "source_filename": "audio.m4a",
         "language_code": "ru",
-        "processing_mode": "zoom_participant_tracks",
+        "processing_mode": "simple" if mixed_audio else "zoom_participant_tracks",
         "participants": participants,
         "zoom_participant_tracks": tracks,
         "primary_recording_file": sanitize_zoom_recording_metadata(primary_file),
@@ -377,6 +408,22 @@ def valid_existing_participant_tracks(metadata: dict[str, object], participant_f
     if not isinstance(tracks, list) or not tracks:
         return False
     return len(participant_files) == len(tracks)
+
+
+def valid_existing_mixed_audio(metadata: dict[str, object], participant_files: list[Path]) -> bool:
+    return (
+        not participant_files
+        and metadata.get("source") == "zoom_cloud_backfill_mixed"
+        and metadata.get("processing_mode") == "simple"
+    )
+
+
+def is_skipped_empty_recording(meeting_dir: Path) -> bool:
+    status = load_metadata(meeting_dir / "status.json")
+    return (
+        status.get("status") == "skipped_empty"
+        and status.get("classification") == "empty_zoom_session"
+    )
 
 
 def load_metadata(path: Path) -> dict[str, object]:

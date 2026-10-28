@@ -2766,11 +2766,12 @@ def _dedupe_protocol_sections(*sections: list[dict[str, Any]]) -> None:
 
 def _protocol_ref(report: MeetingReport, citations: list[str]) -> str:
     records = {record.segment_id: record for record in report.transcript}
-    for segment_id in citations:
+    refs = []
+    for segment_id in dict.fromkeys(citations):
         record = records.get(segment_id)
         if record is not None:
-            return f"{segment_id} · {fmt_time(record.start)}"
-    return ""
+            refs.append(f"{segment_id} · {fmt_time(record.start)}")
+    return "; ".join(refs)
 
 
 def _protocol_tldr(report: MeetingReport) -> list[str]:

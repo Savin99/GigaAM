@@ -4,7 +4,8 @@
 Кладёт отчёты в отдельную папку Диска (по умолч. «Отчёты встреч Coherent [ZOOM]»),
 по подпапке на УНИКАЛЬНУЮ встречу (дедуп по mapping.json). Имя подпапки совпадает с
 аудио-папкой архива (берётся из status.json → archived_audio.disk_path), иначе строится
-из created_at + source_filename. Грузит report.pdf / report.md / report.html.
+из created_at + source_filename. Грузит report.pdf / report.md / report.html,
+transcript.md, coverage.json и read-only снимок youtrack_context.json.
 
 Токен и базовая папка — из .env.local (YANDEX_DISK_OAUTH_TOKEN). Секреты не печатаем.
 Без флагов — DRY-RUN; --apply — заливка.
@@ -23,7 +24,14 @@ import httpx
 API = "https://cloud-api.yandex.net/v1/disk"
 HTTP_TIMEOUT = httpx.Timeout(600.0, connect=30.0)
 DEFAULT_REPORTS_DIR = "Отчёты встреч Coherent [ZOOM]"
-REPORT_FILES = ["report.pdf", "report.md", "report.html"]
+REPORT_FILES = [
+    "report.pdf",
+    "report.md",
+    "report.html",
+    "transcript.md",
+    "coverage.json",
+    "youtrack_context.json",
+]
 
 
 def _load_env_local(path: Path) -> None:
@@ -89,6 +97,11 @@ def _report_source(group_dirs: list[Path]) -> Path | None:
         ).exists():
             return d / "artifacts"
     return None
+
+
+def _report_files(src: Path) -> list[Path]:
+    """Публичные файлы встречи, которые реально существуют локально."""
+    return [src / filename for filename in REPORT_FILES if (src / filename).exists()]
 
 
 def _mkdir(client: httpx.Client, disk_path: str) -> None:
@@ -196,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
             ct = _clean_title(title) if title else ""
             date = _date_for([d], "")
             label = f"{date} {ct}".strip() if (date and ct) else (ct or d.name)
-            files = [(src / f) for f in REPORT_FILES if (src / f).exists()]
+            files = _report_files(src)
             if not files:
                 plan.append(
                     {
@@ -232,7 +245,7 @@ def main(argv: list[str] | None = None) -> int:
                     }
                 )
                 continue
-            files = [(src / f) for f in REPORT_FILES if (src / f).exists()]
+            files = _report_files(src)
             plan.append(
                 {
                     "key": key,
@@ -300,7 +313,10 @@ def main(argv: list[str] | None = None) -> int:
     total_files = sum(len(p["files"]) for p in ok_plan)
     total_bytes = sum(f.stat().st_size for p in ok_plan for f in p["files"])
     mode = "APPLY" if args.apply else "DRY-RUN"
-    print(f"Режим: {mode}  →  disk:{base}/<встреча>/<report.pdf|md|html>")
+    print(
+        f"Режим: {mode}  →  disk:{base}/<встреча>/"
+        "<report.pdf|report.md|report.html|transcript.md|coverage.json|youtrack_context.json>"
+    )
     print(
         f"Встреч: {len(ok_plan)} | файлов: {total_files} | объём: {_human(total_bytes)}\n"
     )

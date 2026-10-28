@@ -1,6 +1,9 @@
 import json
 import os
+import secrets
 import shutil
+import subprocess
+import sys
 import traceback
 import uuid
 from collections.abc import AsyncIterator
@@ -25,6 +28,7 @@ from fastapi.staticfiles import StaticFiles
 
 from mac_transcriber.archive import write_meeting_manifest
 from mac_transcriber.asr import resolve_meeting_title, transcribe_meeting
+from mac_transcriber.chatgpt_auth import load_chatgpt_bridge_api_key
 from mac_transcriber.memory_db import sync_meeting_memory
 from mac_transcriber.reporting import ReportQuotaError, ReportUnavailableError
 
@@ -46,6 +50,7 @@ ROOT = Path(os.environ.get("MAC_TRANSCRIBER_ROOT", ".local/mac_transcriber")).re
 PACKAGE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = PACKAGE_DIR / "static"
 API_KEY = os.environ.get("MAC_TRANSCRIBER_API_KEY", "")
+CHATGPT_BRIDGE_API_KEY = load_chatgpt_bridge_api_key()
 MODEL_NAME = os.environ.get("MAC_TRANSCRIBER_MODEL", "v3_e2e_rnnt")
 CACHE_DIR = os.environ.get("MAC_TRANSCRIBER_CACHE", "/tmp/gigaam-cache")
 DEVICE = os.environ.get("MAC_TRANSCRIBER_DEVICE", "cpu")
@@ -53,8 +58,10 @@ BATCH_SIZE = int(os.environ.get("MAC_TRANSCRIBER_BATCH_SIZE", "4"))
 _PROCESS_LOCK = Lock()
 
 ARTIFACTS = {
+    "asr_metadata_json": ("asr_metadata.json", "application/json"),
     "manifest_json": ("manifest.json", "application/json"),
     "context_pack_json": ("context_pack.json", "application/json"),
+    "youtrack_context_json": ("youtrack_context.json", "application/json"),
     "transcript_md": ("transcript.md", "text/markdown; charset=utf-8"),
     "transcript_json": ("transcript.json", "application/json"),
     "summary_json": ("summary.json", "application/json"),
@@ -94,11 +101,26 @@ app = FastAPI(title="GigaAM Mac Transcriber", lifespan=app_lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
-def require_auth(authorization: Annotated[str | None, Header()] = None) -> None:
+def require_operator_auth(authorization: Annotated[str | None, Header()] = None) -> None:
+    """Protect the existing Slack/Zoom contract from the scoped bridge key."""
+
     if not API_KEY:
+        if CHATGPT_BRIDGE_API_KEY:
+            raise HTTPException(status_code=401, detail="Unauthorized")
         return
-    if authorization != f"Bearer {API_KEY}":
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if authorization and secrets.compare_digest(authorization, f"Bearer {API_KEY}"):
+        return
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def require_chatgpt_bridge_auth(
+    authorization: Annotated[str | None, Header()] = None,
+) -> None:
+    if CHATGPT_BRIDGE_API_KEY and authorization and secrets.compare_digest(
+        authorization, f"Bearer {CHATGPT_BRIDGE_API_KEY}"
+    ):
+        return
+    raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 @app.get("/healthz")
@@ -116,7 +138,7 @@ def ui_index() -> HTMLResponse:
 def ui_config() -> dict[str, object]:
     return {
         # Не отдаём сам секрет наружу: UI запрашивает ключ у оператора, когда auth_required.
-        "auth_required": bool(API_KEY),
+        "auth_required": bool(API_KEY or CHATGPT_BRIDGE_API_KEY),
         "model": MODEL_NAME,
         "device": DEVICE,
         "batch_size": BATCH_SIZE,
@@ -124,32 +146,107 @@ def ui_config() -> dict[str, object]:
     }
 
 
-@app.post("/meetings", dependencies=[Depends(require_auth)])
+@app.post("/meetings", dependencies=[Depends(require_operator_auth)])
 async def create_meeting(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     zoom_participant_files: list[UploadFile] | None = File(default=None),
     language_code: str = Form(default="ru"),
     processing_mode: str = Form(default="simple"),
+    transcript_only: bool = Form(default=False),
     title: str | None = Form(default=None),
     meeting_title: str | None = Form(default=None),
     topic: str | None = Form(default=None),
     participants: str | None = Form(default=None),
     zoom_participant_tracks_json: str | None = Form(default=None),
     request_id: str | None = Form(default=None),
+    microphone_mode: str | None = Form(default=None),
+    terms_hint: str | None = Form(default=None),
 ) -> dict[str, str]:
+    return await _create_meeting(
+        background_tasks=background_tasks,
+        file=file,
+        zoom_participant_files=zoom_participant_files,
+        language_code=language_code,
+        processing_mode=processing_mode,
+        transcript_only=transcript_only,
+        title=title,
+        meeting_title=meeting_title,
+        topic=topic,
+        participants=participants,
+        zoom_participant_tracks_json=zoom_participant_tracks_json,
+        request_id=request_id,
+        microphone_mode=microphone_mode,
+        terms_hint=terms_hint,
+    )
+
+
+@app.post("/chatgpt/meetings", dependencies=[Depends(require_chatgpt_bridge_auth)])
+async def create_chatgpt_meeting(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    title: str | None = Form(default=None),
+    request_id: str | None = Form(default=None),
+) -> dict[str, str]:
+    """Accept one mixed recording and force the transcript-only workflow."""
+
+    return await _create_meeting(
+        background_tasks=background_tasks,
+        file=file,
+        zoom_participant_files=None,
+        language_code="ru",
+        processing_mode="simple",
+        transcript_only=True,
+        title=title,
+        meeting_title=None,
+        topic=None,
+        participants=None,
+        zoom_participant_tracks_json=None,
+        request_id=request_id,
+        ingress="chatgpt_mcp",
+    )
+
+
+async def _create_meeting(
+    *,
+    background_tasks: BackgroundTasks,
+    file: UploadFile,
+    zoom_participant_files: list[UploadFile] | None,
+    language_code: str,
+    processing_mode: str,
+    transcript_only: bool,
+    title: str | None,
+    meeting_title: str | None,
+    topic: str | None,
+    participants: str | None,
+    zoom_participant_tracks_json: str | None,
+    request_id: str | None,
+    ingress: str | None = None,
+    microphone_mode: str | None = None,
+    terms_hint: str | None = None,
+) -> dict[str, str]:
+
+    if microphone_mode not in (None, "auto", "single", "room", "unknown"):
+        raise HTTPException(status_code=422, detail="Invalid microphone_mode")
+    for track in _parse_tracks(zoom_participant_tracks_json):
+        if not isinstance(track, dict) or track.get("microphone_mode", "unknown") not in {"auto", "single", "room", "unknown"}:
+            raise HTTPException(status_code=422, detail="Invalid track microphone_mode")
+
     meeting_id = _meeting_id_for_request(request_id)
     meeting_dir = ROOT / "meetings" / meeting_id
     existing = _read_status(meeting_dir)
     if existing:
+        _require_matching_ingress(meeting_dir, ingress)
         return {"id": meeting_id, "status": str(existing.get("status") or "uploaded")}
 
-    # Idempotent submissions are first written outside the live meetings tree and
+    # Idempotent submissions are first written in a hidden staging directory and
     # moved into place only after every multipart file is complete. A client may
     # safely retry after a broken SSH/HTTP connection: it either recovers the
     # existing request_id or starts from a clean staging directory.
+    # Keep staging on the meetings filesystem: meetings may link to an external
+    # disk, and rename must remain atomic rather than copy between volumes.
     staging_dir = (
-        ROOT / ".uploads" / f"{meeting_id}-{uuid.uuid4()}"
+        meeting_dir.parent / ".uploads" / f"{meeting_id}-{uuid.uuid4()}"
         if request_id
         else None
     )
@@ -169,9 +266,16 @@ async def create_meeting(
             "source_filename": file.filename,
             "language_code": language_code,
             "processing_mode": processing_mode,
+            "transcript_only": transcript_only,
             "participants": _split_csv(participants),
             "zoom_participant_tracks": _parse_tracks(zoom_participant_tracks_json),
         }
+        if microphone_mode:
+            metadata["microphone_mode"] = microphone_mode
+        if terms_hint:
+            metadata["terms_hint"] = terms_hint
+        if ingress:
+            metadata["ingress"] = ingress
         metadata["title"] = resolve_meeting_title(
             {
                 **metadata,
@@ -206,6 +310,7 @@ async def create_meeting(
             if meeting_dir.exists():
                 existing = _read_status(meeting_dir)
                 if existing:
+                    _require_matching_ingress(meeting_dir, ingress)
                     return {
                         "id": meeting_id,
                         "status": str(existing.get("status") or "uploaded"),
@@ -223,7 +328,7 @@ async def create_meeting(
     return {"id": meeting_id, "status": "uploaded"}
 
 
-@app.get("/meetings", dependencies=[Depends(require_auth)])
+@app.get("/meetings", dependencies=[Depends(require_operator_auth)])
 def list_meetings() -> dict[str, list[dict]]:
     meetings_dir = ROOT / "meetings"
     if not meetings_dir.exists():
@@ -244,7 +349,7 @@ def list_meetings() -> dict[str, list[dict]]:
     return {"meetings": items}
 
 
-@app.get("/meetings/{meeting_id}/status", dependencies=[Depends(require_auth)])
+@app.get("/meetings/{meeting_id}/status", dependencies=[Depends(require_operator_auth)])
 def meeting_status(meeting_id: str) -> dict:
     meeting_dir = _meeting_dir(meeting_id)
     status_path = meeting_dir / "status.json"
@@ -257,22 +362,58 @@ def meeting_status(meeting_id: str) -> dict:
 
 
 @app.get(
-    "/meetings/{meeting_id}/artifacts/{kind}", dependencies=[Depends(require_auth)]
+    "/meetings/{meeting_id}/artifacts/{kind}",
+    dependencies=[Depends(require_operator_auth)],
 )
 def meeting_artifact(meeting_id: str, kind: str):
     if kind not in ARTIFACTS:
         raise HTTPException(status_code=404, detail="Artifact not found")
+    meeting_dir = _meeting_dir(meeting_id)
     filename, media_type = ARTIFACTS[kind]
-    path = _meeting_dir(meeting_id) / "artifacts" / filename
+    path = meeting_dir / "artifacts" / filename
     if not path.exists():
         raise HTTPException(status_code=404, detail="Artifact not found")
     return FileResponse(path, media_type=media_type, filename=filename)
+
+
+@app.get(
+    "/chatgpt/meetings/{meeting_id}/status",
+    dependencies=[Depends(require_chatgpt_bridge_auth)],
+)
+def chatgpt_meeting_status(meeting_id: str) -> dict[str, object]:
+    meeting_dir = _meeting_dir(meeting_id)
+    status_path = meeting_dir / "status.json"
+    if not status_path.exists():
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    _require_chatgpt_meeting(meeting_dir)
+    return _chatgpt_status_view(_read_status(meeting_dir), meeting_dir)
+
+
+@app.get(
+    "/chatgpt/meetings/{meeting_id}/transcript",
+    dependencies=[Depends(require_chatgpt_bridge_auth)],
+)
+def chatgpt_meeting_transcript(meeting_id: str):
+    meeting_dir = _meeting_dir(meeting_id)
+    status_path = meeting_dir / "status.json"
+    if not status_path.exists():
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    _require_chatgpt_meeting(meeting_dir)
+    path = meeting_dir / "artifacts" / "transcript.md"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    return FileResponse(
+        path,
+        media_type="text/markdown; charset=utf-8",
+        filename="transcript.md",
+    )
 
 
 def _process_meeting(meeting_id: str) -> None:
     meeting_dir = _meeting_dir(meeting_id)
     with _PROCESS_LOCK:
         try:
+            metadata = _read_json_file(meeting_dir / "input" / "metadata.json")
             _write_status(
                 meeting_dir,
                 "processing",
@@ -286,6 +427,7 @@ def _process_meeting(meeting_id: str) -> None:
                 cache_dir=CACHE_DIR,
                 device=DEVICE,
                 batch_size=BATCH_SIZE,
+                include_report=not bool(metadata.get("transcript_only")),
                 status_callback=lambda status, **payload: _write_status(
                     meeting_dir, status, **payload
                 ),
@@ -325,6 +467,23 @@ def _process_meeting(meeting_id: str) -> None:
                 ],
             )
         except Exception as exc:  # noqa: BLE001
+            from mac_transcriber.scribe import ScribeReconciliationRequired
+
+            if (
+                isinstance(exc, ScribeReconciliationRequired)
+                and not metadata.get("transcript_only")
+                and os.environ.get("MAC_TRANSCRIBER_SCRIBE_LOCAL_RECOVERY", "0").lower()
+                in {"1", "true", "yes"}
+            ):
+                _write_status(
+                    meeting_dir, "processing", phase="local_recovery", progress=0.1,
+                    message="Cloud ASR outcome unknown; recovering from caches and local GigaAM without resubmission",
+                )
+                try:
+                    _recover_scribe_locally(meeting_dir)
+                    return
+                except Exception as recovery_error:  # noqa: BLE001
+                    exc = recovery_error
             _write_status(
                 meeting_dir,
                 "failed",
@@ -334,6 +493,18 @@ def _process_meeting(meeting_id: str) -> None:
                 error=str(exc),
                 traceback=traceback.format_exc(),
             )
+
+
+def _recover_scribe_locally(meeting_dir: Path) -> None:
+    subprocess.run(
+        [
+            sys.executable, str(PACKAGE_DIR / "scripts/recover_scribe_locally.py"),
+            str(meeting_dir), "--model-cache",
+            os.environ.get("MAC_TRANSCRIBER_LOCAL_MODEL_CACHE", str(Path.home() / ".cache/gigaam")),
+            "--publish",
+        ],
+        check=True, timeout=7200,
+    )
 
 
 def _interrupted_meeting_ids() -> list[str]:
@@ -475,9 +646,54 @@ def _sanitize_status_payload(value: object) -> object:
         return {key: _sanitize_status_payload(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_sanitize_status_payload(item) for item in value]
-    if isinstance(value, str) and API_KEY:
-        return value.replace(API_KEY, "[redacted]")
+    if isinstance(value, str):
+        for credential in (API_KEY, CHATGPT_BRIDGE_API_KEY):
+            if credential:
+                value = value.replace(credential, "[redacted]")
     return value
+
+
+def _require_matching_ingress(meeting_dir: Path, ingress: str | None) -> None:
+    """A ChatGPT retry must never attach to an operator-created job."""
+
+    if ingress != "chatgpt_mcp":
+        return
+    metadata = _read_json_file(meeting_dir / "input" / "metadata.json")
+    if metadata.get("ingress") != "chatgpt_mcp":
+        raise HTTPException(
+            status_code=409,
+            detail="The ChatGPT request ID is already used by another job",
+        )
+
+
+def _require_chatgpt_meeting(meeting_dir: Path) -> None:
+    metadata = _read_json_file(meeting_dir / "input" / "metadata.json")
+    if metadata.get("ingress") != "chatgpt_mcp":
+        raise HTTPException(status_code=404, detail="Meeting not found")
+
+
+def _chatgpt_status_view(status: dict, meeting_dir: Path) -> dict[str, object]:
+    metadata = status.get("metadata")
+    result = status.get("result")
+    progress = status.get("progress")
+    return {
+        "id": str(status.get("id") or meeting_dir.name),
+        "status": str(status.get("status") or "unknown"),
+        "phase": str(status.get("phase") or ""),
+        "progress": (
+            max(0.0, min(1.0, float(progress)))
+            if isinstance(progress, (int, float))
+            else None
+        ),
+        "message": str(status.get("message") or "")[:300],
+        "source_filename": (
+            str(metadata.get("source_filename") or "")
+            if isinstance(metadata, dict)
+            else ""
+        ),
+        "segments": result.get("segments") if isinstance(result, dict) else None,
+        "transcript_ready": "transcript_md" in _available_artifacts(meeting_dir),
+    }
 
 
 async def _save_upload(upload: UploadFile, path: Path) -> None:

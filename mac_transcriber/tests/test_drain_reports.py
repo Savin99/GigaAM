@@ -10,7 +10,9 @@ _bump_attempt и файловый лок _acquire_lock (fcntl.flock).
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 # scripts/ не является пакетом (нет __init__.py), поэтому грузим модуль по пути.
 # Импорт сам выполняет sys.path.insert(repo_root/scripts) из тела модуля и
@@ -21,6 +23,35 @@ _DRAIN_PATH = (
 _spec = importlib.util.spec_from_file_location("drain_reports_via_claude", _DRAIN_PATH)
 drain = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(drain)
+
+
+def test_youtrack_agent_instructions_are_packaged():
+    assert drain.YOUTRACK_INSTRUCTIONS.exists()
+
+
+def test_targeted_drain_does_not_process_or_reupload_other_meetings(tmp_path, monkeypatch, capsys):
+    import mac_transcriber
+
+    service = SimpleNamespace(ROOT=tmp_path)
+    monkeypatch.setitem(sys.modules, "mac_transcriber.service", service)
+    monkeypatch.setattr(mac_transcriber, "service", service, raising=False)
+
+    meetings = tmp_path / "meetings"
+    target = meetings / "target"
+    other = meetings / "other"
+    reupload = meetings / "reupload"
+    for d in (target, other, reupload):
+        (d / "artifacts").mkdir(parents=True)
+        (d / "status.json").write_text(json.dumps({"status": "completed"}))
+        (d / "artifacts" / "report.md").write_text("report")
+    monkeypatch.setattr(drain, "_load_env_files", lambda paths: None)
+    monkeypatch.setattr(drain.rb, "_blocked_meetings", lambda root: [other, target])
+    monkeypatch.setattr(drain.rb, "_needs_regen_meetings", lambda root, excluded: [])
+    assert drain.main(["--meeting-id", "target", "--dry-run"]) == 0
+    output = capsys.readouterr().out
+    assert "[blocked] target" in output
+    assert "[blocked] other" not in output
+    assert "[reupload] reupload" not in output
 
 
 def _make_meeting(tmp_path: Path, status: dict | None = None) -> Path:
@@ -80,6 +111,56 @@ def test_payload_is_valid_variants(tmp_path: Path):
         encoding="utf-8",
     )
     assert drain._payload_is_valid(good) is True
+
+
+def test_json_object_has_key_requires_list(tmp_path):
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps({"intents": []}), encoding="utf-8")
+    wrong = tmp_path / "wrong.json"
+    wrong.write_text(json.dumps({"intents": {}}), encoding="utf-8")
+
+    assert drain._json_object_has_key(good, "intents") is True
+    assert drain._json_object_has_key(wrong, "intents") is False
+
+
+def test_prepare_youtrack_context_can_be_explicitly_disabled(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "agent_input.json").write_text(
+        json.dumps(
+            {
+                "segments": [
+                    {"segment_id": "S0001", "text": "Обсудили задачу."}
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    context = drain._prepare_youtrack_context(
+        work=work,
+        model="claude-opus-5",
+        enabled=False,
+    )
+
+    assert context["status"] == "disabled"
+    enriched = json.loads((work / "agent_input.json").read_text(encoding="utf-8"))
+    assert enriched["youtrack_context"]["status"] == "disabled"
+
+
+# --- выбор Claude-модели -------------------------------------------------
+
+
+def test_resolve_claude_model_reads_env_loaded_after_argparse(monkeypatch):
+    monkeypatch.setenv("MAC_TRANSCRIBER_CLAUDE_MODEL", " opus ")
+
+    assert drain._resolve_claude_model(None) == "opus"
+
+
+def test_resolve_claude_model_cli_overrides_env(monkeypatch):
+    monkeypatch.setenv("MAC_TRANSCRIBER_CLAUDE_MODEL", "sonnet")
+
+    assert drain._resolve_claude_model(" claude-opus-4-8 ") == "claude-opus-4-8"
 
 
 # --- _needs_disk_upload ---------------------------------------------------
@@ -217,3 +298,20 @@ def test_acquire_lock_is_exclusive_and_releases(tmp_path):
         for fd in (fd1, fd2, fd3):
             if fd is not None:
                 fd.close()
+
+
+def test_evidence_error_gets_one_repair_attempt(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    source={'evidence_contract_version':1,'segments':[{'segment_id':'S0001','text':'Сделаю MR сегодня-завтра.'}]}
+    (tmp_path/'agent_input.json').write_text(json.dumps(source))
+    calls=[]
+    def generate(cmd, **kwargs):
+        calls.append(cmd)
+        quote='Неверная цитата из соседней реплики.' if len(calls)==1 else source['segments'][0]['text']
+        payload={'adaptive_sections':[{'title':'Раздел'}],'action_items':[{'title':'MR','text':'Подготовить MR','certainty':'confirmed','citations':['S0001'],'evidence':[{'segment_id':'S0001','quote':quote}]}]}
+        (tmp_path/'ai_payload.json').write_text(json.dumps(payload))
+        return SimpleNamespace(stdout='',stderr='',returncode=0)
+    monkeypatch.setattr(drain.subprocess,'run',generate)
+    assert drain._generate_payload(tmp_path,'')=='ok'
+    assert len(calls)==2
+    assert 'evidence_feedback.json' in ' '.join(calls[1])

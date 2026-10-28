@@ -210,6 +210,42 @@ def test_prepare_meeting_dir_requires_participant_audio_files(tmp_path):
         raise AssertionError("participant tracks should be required")
 
 
+def test_prepare_meeting_dir_allows_explicit_mixed_audio_fallback(tmp_path):
+    class FakeClient:
+        def download_recording_file(self, url):
+            return b"mixed-audio"
+
+    prepared = backfill.prepare_meeting_dir(
+        recording={
+            "uuid": "mixed",
+            "id": 123,
+            "topic": "Mixed only",
+            "recording_files": [
+                {
+                    "id": "audio",
+                    "file_type": "M4A",
+                    "download_url": "https://zoom/audio",
+                }
+            ],
+        },
+        client=FakeClient(),
+        work_root=tmp_path,
+        force=False,
+        allow_mixed_audio=True,
+    )
+
+    metadata = json.loads(
+        (prepared.meeting_dir / "input" / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert prepared.participant_tracks == 0
+    assert (prepared.meeting_dir / "input" / "audio.m4a").read_bytes() == b"mixed-audio"
+    assert list((prepared.meeting_dir / "input" / "participants").glob("*.m4a")) == []
+    assert metadata["source"] == "zoom_cloud_backfill_mixed"
+    assert metadata["processing_mode"] == "simple"
+    assert metadata["participants"] == []
+    assert metadata["zoom_participant_tracks"] == []
+
+
 def test_prepare_meeting_dir_requires_downloadable_participant_audio_files(tmp_path):
     downloads = []
 
@@ -358,6 +394,63 @@ def test_backfill_dry_run_lists_recordings_without_download(tmp_path, monkeypatc
 
     assert result == [{"meeting_id": "zoom_one", "status": "dry_run", "title": "One"}]
     assert not (tmp_path / "zoom_one").exists()
+
+
+def test_backfill_preserves_explicit_empty_recording_classification(tmp_path, monkeypatch):
+    class FakeClient:
+        def list_recordings(self, *, user_id, start_date, end_date, page_size):
+            return [{"uuid": "empty", "id": 1, "topic": "Empty"}]
+
+        def get_recordings(self, *, meeting_id):
+            raise AssertionError("known empty recordings must not be fetched again")
+
+    meeting_dir = tmp_path / "zoom_empty"
+    meeting_dir.mkdir()
+    (meeting_dir / "status.json").write_text(
+        json.dumps(
+            {
+                "status": "skipped_empty",
+                "classification": "empty_zoom_session",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(backfill, "ZoomClient", lambda **_kwargs: FakeClient())
+    monkeypatch.setattr(
+        backfill,
+        "transcribe_meeting",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("known empty recordings must not be transcribed")
+        ),
+    )
+
+    result = backfill.backfill_zoom_recordings(
+        env={
+            "ZOOM_ACCOUNT_ID": "account",
+            "ZOOM_CLIENT_ID": "client",
+            "ZOOM_CLIENT_SECRET": "secret",
+            "ZOOM_HOST_USER_ID": "me",
+        },
+        start_date="2026-06-01",
+        end_date="2026-06-16",
+        work_root=tmp_path,
+        dry_run=False,
+        limit=10,
+        force=False,
+        download_only=False,
+        page_size=50,
+        allow_mixed_audio=True,
+    )
+
+    assert result == [
+        {
+            "meeting_id": "zoom_empty",
+            "status": "skipped_empty",
+            "title": "Empty",
+            "meeting_dir": str(meeting_dir),
+        }
+    ]
 
 
 def test_apply_runtime_env_sets_transcriber_environment(monkeypatch):

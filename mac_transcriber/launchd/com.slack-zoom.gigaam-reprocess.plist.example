@@ -12,7 +12,7 @@
   <!-- Дренирует очередь blocked_on_quota/blocked_on_ai: дообрабатывает встречи,
        отложенные из-за недоступности AI, когда API снова доступен. Секреты
        (OPENAI_API_KEY, MAC_TRANSCRIBER_DATABASE_URL) берутся из .env.local через
-       --env-file, поэтому в plist их нет. -->
+       опцию env-file, поэтому в plist их нет. -->
   <key>ProgramArguments</key>
   <array>
     <string>/Users/ilyaqa/Projects/GigaAM/.venv/bin/python</string>

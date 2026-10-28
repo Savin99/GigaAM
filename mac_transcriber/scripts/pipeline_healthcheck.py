@@ -23,19 +23,26 @@ ENV (в .env.local):
   MAC_TRANSCRIBER_RELAY_URL             URL relay на VPS (по умолч.
                                         http://127.0.0.1:18013/healthz).
   MAC_TRANSCRIBER_TUNNEL_TARGET         SSH target VPS (по умолч.
-                                        root@193.233.87.211).
+                                        root@111.88.224.176).
   MAC_TRANSCRIBER_TUNNEL_IDENTITY_FILE  SSH key для VPS.
   MAC_TRANSCRIBER_CLAUDE_PROMPT_HEALTHCHECK
                                         1/true/yes — проверять claude -p даже
                                         если backend не claude.
   MAC_TRANSCRIBER_CLAUDE_HEALTHCHECK_ATTEMPTS
                                         число попыток claude -p (по умолч. 2).
+  MAC_TRANSCRIBER_TELEGRAM_FAILURE_THRESHOLD
+                                        сколько последовательных сбоев нужно
+                                        до Telegram-алерта (по умолч. 2).
+  MAC_TRANSCRIBER_HEALTHCHECK_STATE_PATH
+                                        опц. путь к локальному состоянию
+                                        дедупликации Telegram-алертов.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -144,16 +151,27 @@ def check_claude() -> tuple[bool, str]:
         except Exception as exc:  # noqa: BLE001
             last_error = f"claude prompt error: {type(exc).__name__}: {exc}"[:100]
             continue
-        if prompt.returncode == 0:
+        try:
+            payload = json.loads(prompt.stdout or "")
+        except (ValueError, TypeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        result = str(payload.get("result") or "")
+        if "OAuth session expired" in result:
+            return False, "claude OAuth session expired; run claude auth login"
+        if "not logged in" in result.lower():
+            return False, "claude not logged in; run claude auth login"
+        if prompt.returncode == 0 and not payload.get("is_error"):
             return True, f"{version_msg}; prompt ok"
-        tail = ((prompt.stdout or "") + " " + (prompt.stderr or "")).strip()
+        tail = result or ((prompt.stdout or "") + " " + (prompt.stderr or "")).strip()
         last_error = f"claude prompt rc={prompt.returncode}: {tail[-100:]}"
     return False, last_error
 
 
 def check_relay() -> tuple[bool, str]:
     """Проверить relay с точки зрения VPS, а не локального Mac."""
-    target = os.environ.get("MAC_TRANSCRIBER_TUNNEL_TARGET", "root@193.233.87.211")
+    target = os.environ.get("MAC_TRANSCRIBER_TUNNEL_TARGET", "root@111.88.224.176")
     relay_url = os.environ.get(
         "MAC_TRANSCRIBER_RELAY_URL", "http://127.0.0.1:18013/healthz"
     )
@@ -178,7 +196,34 @@ def check_relay() -> tuple[bool, str]:
         return False, f"relay unreachable: {exc}"[:100]
     body = (res.stdout or "") + (res.stderr or "")
     if res.returncode == 0 and '"ok"' in res.stdout:
-        return True, "relay ok"
+        # A public health endpoint can succeed while every real job fails with 401.
+        # Use the worker's own credential in-place; never return it over SSH.
+        probe = """import os, urllib.request, urllib.error
+request = urllib.request.Request(
+    os.environ['TRANSCRIPTION_SERVICE_URL'] + '/meetings/no-such-meeting/status',
+    headers={'Authorization': 'Bearer ' + os.environ['TRANSCRIPTION_SERVICE_API_KEY']})
+try:
+    urllib.request.urlopen(request, timeout=8)
+except urllib.error.HTTPError as exc:
+    print('AUTH_STATUS_CHECK=' + str(exc.code))
+    raise SystemExit(0 if exc.code == 404 else 1)
+raise SystemExit(1)
+"""
+        worker_command = command[:-1] + [
+            "cd /root/projects/slack_zoom && docker compose exec -T worker python -c "
+            + shlex.quote(probe)
+        ]
+        try:
+            worker = subprocess.run(
+                worker_command, capture_output=True, text=True, timeout=20
+            )
+        except Exception as exc:
+            return False, f"relay ok; worker auth check failed: {type(exc).__name__}"
+        if worker.returncode == 0 and "AUTH_STATUS_CHECK=404" in worker.stdout:
+            return True, "relay ok; worker auth ok"
+        if "AUTH_STATUS_CHECK=401" in worker.stdout:
+            return False, "relay ok; worker auth failed: 401 (shared key mismatch)"
+        return False, "relay ok; worker auth check failed"
     return False, f"relay bad: rc={res.returncode} {body.strip()[:80]}"
 
 
@@ -223,17 +268,84 @@ def _ping(url: str, params: dict[str, str]) -> None:
         print(f"healthcheck ping failed: {exc}", file=sys.stderr)
 
 
-def _telegram(token: str, chat_id: str, text: str) -> None:
+def _telegram(token: str, chat_id: str, text: str) -> bool:
     """Алерт в Telegram (Bot API). Молчит, если токен/чат не заданы."""
     if not (token and chat_id):
-        return
+        return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
     try:
         with urllib.request.urlopen(url, data=data, timeout=10) as resp:
             resp.read()
+        return True
     except Exception as exc:  # noqa: BLE001
         print(f"telegram alert failed: {exc}", file=sys.stderr)
+        return False
+
+
+def _alert_state_path() -> Path:
+    configured = os.environ.get("MAC_TRANSCRIBER_HEALTHCHECK_STATE_PATH", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return REPO_ROOT / ".local" / "mac_transcriber" / "healthcheck_alert_state.json"
+
+
+def _load_alert_state(path: Path) -> dict[str, object]:
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"consecutive_failures": 0, "alert_sent": False}
+    if not isinstance(state, dict):
+        return {"consecutive_failures": 0, "alert_sent": False}
+    return state
+
+
+def _save_alert_state(path: Path, state: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(state, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def handle_telegram_alert(
+    *,
+    ok: bool,
+    summary: str,
+    token: str,
+    chat_id: str,
+    state_path: Path,
+    failure_threshold: int,
+) -> bool:
+    """Send one alert per incident, after N consecutive failed checks."""
+    state = _load_alert_state(state_path)
+    if ok:
+        _save_alert_state(
+            state_path, {"consecutive_failures": 0, "alert_sent": False}
+        )
+        return False
+
+    failures = max(0, int(state.get("consecutive_failures", 0))) + 1
+    alert_sent = bool(state.get("alert_sent", False))
+    delivered = False
+    if (
+        failures >= max(1, failure_threshold)
+        and not alert_sent
+        and token
+        and chat_id
+    ):
+        delivered = _telegram(
+            token, chat_id, f"🔴 Mac-пайплайн отчётов: {summary[:350]}"
+        )
+        alert_sent = delivered
+
+    _save_alert_state(
+        state_path,
+        {"consecutive_failures": failures, "alert_sent": alert_sent},
+    )
+    return delivered
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -247,10 +359,19 @@ def main(argv: list[str] | None = None) -> int:
     summary = "; ".join(lines)
     print(f"[{'OK' if ok else 'FAIL'}] {summary}")
 
-    # Telegram — только алерт о проблеме (то, что VPS-watchdog не видит:
-    # застрявшая очередь / сломанный claude). Не heartbeat.
-    if not ok and tg_token and tg_chat:
-        _telegram(tg_token, tg_chat, f"🔴 Mac-пайплайн отчётов: {summary[:350]}")
+    # Telegram — после нескольких последовательных сбоев и один раз на инцидент.
+    # Успешная проверка сбрасывает состояние, но не создаёт лишний heartbeat.
+    threshold = int(
+        os.environ.get("MAC_TRANSCRIBER_TELEGRAM_FAILURE_THRESHOLD", "2")
+    )
+    handle_telegram_alert(
+        ok=ok,
+        summary=summary,
+        token=tg_token,
+        chat_id=tg_chat,
+        state_path=_alert_state_path(),
+        failure_threshold=threshold,
+    )
 
     # Heartbeat-URL (Uptime Kuma / Healthchecks): up при здоровье, down при сбое.
     if url:

@@ -90,6 +90,26 @@ def test_run_checks_ok_when_healthy(tmp_path, monkeypatch):
     assert any("queue ok" in ln for ln in lines)
 
 
+def test_relay_health_does_not_hide_worker_auth_failure(monkeypatch):
+    responses = iter([
+        subprocess.CompletedProcess([], 0, stdout='{"status":"ok"}', stderr=""),
+        subprocess.CompletedProcess([], 1, stdout="AUTH_STATUS_CHECK=401", stderr=""),
+    ])
+    monkeypatch.setattr(hc.subprocess, "run", lambda *a, **kw: next(responses))
+    assert hc.check_relay() == (
+        False, "relay ok; worker auth failed: 401 (shared key mismatch)"
+    )
+
+
+def test_relay_checks_worker_authorization(monkeypatch):
+    responses = iter([
+        subprocess.CompletedProcess([], 0, stdout='{"status":"ok"}', stderr=""),
+        subprocess.CompletedProcess([], 0, stdout="AUTH_STATUS_CHECK=404", stderr=""),
+    ])
+    monkeypatch.setattr(hc.subprocess, "run", lambda *a, **kw: next(responses))
+    assert hc.check_relay() == (True, "relay ok; worker auth ok")
+
+
 def test_check_claude_version_only_when_backend_not_claude(monkeypatch):
     calls = []
 
@@ -135,6 +155,42 @@ def test_check_claude_prompt_required_for_claude_backend(monkeypatch):
     ]
 
 
+def test_check_claude_reports_expired_oauth_without_json_tail(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        if cmd[1] == "--version":
+            return subprocess.CompletedProcess(cmd, 0, stdout="2.1.186", stderr="")
+        return subprocess.CompletedProcess(cmd, 1, stdout=json.dumps({
+            "is_error": True,
+            "result": "Failed to authenticate: OAuth session expired and could not be refreshed",
+            "uuid": "irrelevant-trailing-metadata",
+        }), stderr="")
+
+    monkeypatch.setattr(hc.shutil, "which", lambda name: "/usr/local/bin/claude")
+    monkeypatch.setattr(hc.subprocess, "run", fake_run)
+    monkeypatch.setenv("MAC_TRANSCRIBER_REPORT_BACKEND", "claude")
+    assert hc.check_claude() == (
+        False, "claude OAuth session expired; run claude auth login"
+    )
+
+
+def test_check_claude_reports_missing_login_without_json_tail(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        if cmd[1] == "--version":
+            return subprocess.CompletedProcess(cmd, 0, stdout="2.1.251", stderr="")
+        return subprocess.CompletedProcess(cmd, 1, stdout=json.dumps({
+            "is_error": True,
+            "result": "Not logged in · Please run /login",
+            "uuid": "irrelevant-trailing-metadata",
+        }), stderr="Client.listTools() called but server does not advertise tools capability")
+
+    monkeypatch.setattr(hc.shutil, "which", lambda name: "/usr/local/bin/claude")
+    monkeypatch.setattr(hc.subprocess, "run", fake_run)
+    monkeypatch.setenv("MAC_TRANSCRIBER_REPORT_BACKEND", "claude")
+    assert hc.check_claude() == (
+        False, "claude not logged in; run claude auth login"
+    )
+
+
 def test_check_claude_retries_transient_prompt_timeout(monkeypatch):
     calls = []
 
@@ -165,3 +221,55 @@ def test_check_claude_retries_transient_prompt_timeout(monkeypatch):
         ["/usr/local/bin/claude", "-p", "ping", "--output-format", "json"],
         ["/usr/local/bin/claude", "-p", "ping", "--output-format", "json"],
     ]
+
+
+def test_telegram_alert_waits_and_deduplicates_until_recovery(tmp_path, monkeypatch):
+    state_path = tmp_path / "healthcheck-alert.json"
+    sent = []
+
+    def fake_telegram(token, chat_id, text):
+        sent.append((token, chat_id, text))
+        return True
+
+    monkeypatch.setattr(hc, "_telegram", fake_telegram)
+
+    kwargs = {
+        "summary": "relay bad",
+        "token": "token",
+        "chat_id": "chat",
+        "state_path": state_path,
+        "failure_threshold": 2,
+    }
+    assert hc.handle_telegram_alert(ok=False, **kwargs) is False
+    assert sent == []
+    assert hc.handle_telegram_alert(ok=False, **kwargs) is True
+    assert len(sent) == 1
+    assert hc.handle_telegram_alert(ok=False, **kwargs) is False
+    assert len(sent) == 1
+
+    assert hc.handle_telegram_alert(ok=True, **kwargs) is False
+    assert hc.handle_telegram_alert(ok=False, **kwargs) is False
+    assert len(sent) == 1
+
+
+def test_telegram_alert_retries_when_delivery_failed(tmp_path, monkeypatch):
+    state_path = tmp_path / "healthcheck-alert.json"
+    attempts = []
+
+    def fake_telegram(token, chat_id, text):
+        attempts.append(text)
+        return len(attempts) > 1
+
+    monkeypatch.setattr(hc, "_telegram", fake_telegram)
+    kwargs = {
+        "ok": False,
+        "summary": "relay bad",
+        "token": "token",
+        "chat_id": "chat",
+        "state_path": state_path,
+        "failure_threshold": 1,
+    }
+    assert hc.handle_telegram_alert(**kwargs) is False
+    assert hc.handle_telegram_alert(**kwargs) is True
+    assert hc.handle_telegram_alert(**kwargs) is False
+    assert len(attempts) == 2
