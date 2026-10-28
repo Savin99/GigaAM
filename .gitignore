@@ -9,6 +9,7 @@ train_utils/data
 train_utils/checkpoints
 
 .venv
+.local/
 .mypy_cache
 .pytest_cache
 scripts
@@ -18,3 +19,8 @@ scripts
 .coverage.*
 *,cover
 htmlcov
+
+# Локальные настройки и ссылки на внешний диск
+.claude/
+coreml-build
+zoom-запись
