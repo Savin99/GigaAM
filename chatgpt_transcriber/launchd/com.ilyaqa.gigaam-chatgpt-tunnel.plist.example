@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ilyaqa.gigaam-chatgpt-tunnel</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/ilyaqa/Projects/GigaAM</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/ilyaqa/Projects/GigaAM/.venv/bin/python</string>
+    <string>/Users/ilyaqa/Projects/GigaAM/chatgpt_transcriber/scripts/run_tunnel_client.py</string>
+    <string>--env-file</string>
+    <string>/Users/ilyaqa/Projects/GigaAM/.local/gigaam-chatgpt-tunnel.env</string>
+    <string>--profile-file</string>
+    <string>/Users/ilyaqa/Projects/GigaAM/.local/chatgpt_transcriber/tunnel-runtime-profiles/gigaam-chatgpt.yaml</string>
+    <string>--binary</string>
+    <string>/Users/ilyaqa/Projects/GigaAM/.local/chatgpt_transcriber/tunnel-client/v0.0.13/tunnel-client</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/ilyaqa/Library/Logs/gigaam-chatgpt/tunnel.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/ilyaqa/Library/Logs/gigaam-chatgpt/tunnel.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ilyaqa.gigaam-chatgpt-service</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/ilyaqa/Projects/GigaAM</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/ilyaqa/Projects/GigaAM/.venv/bin/python</string>
+    <string>-m</string>
+    <string>uvicorn</string>
+    <string>mac_transcriber.service:app</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>18103</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>MPLCONFIGDIR</key>
+    <string>/tmp/gigaam-chatgpt-matplotlib</string>
+    <key>MAC_TRANSCRIBER_ROOT</key>
+    <string>/Users/ilyaqa/Projects/GigaAM/.local/chatgpt_transcriber/service</string>
+    <key>MAC_TRANSCRIBER_MODEL</key>
+    <string>v3_e2e_rnnt</string>
+    <key>MAC_TRANSCRIBER_CACHE</key>
+    <string>/tmp/gigaam-cache</string>
+    <key>MAC_TRANSCRIBER_DEVICE</key>
+    <string>cpu</string>
+    <key>MAC_TRANSCRIBER_DIARIZATION_DEVICE</key>
+    <string>cpu</string>
+    <key>MAC_TRANSCRIBER_BATCH_SIZE</key>
+    <string>4</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/ilyaqa/Library/Logs/gigaam-chatgpt/service.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/ilyaqa/Library/Logs/gigaam-chatgpt/service.err.log</string>
+</dict>
+</plist>

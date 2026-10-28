@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ilyaqa.gigaam-chatgpt-bridge</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/ilyaqa/Projects/GigaAM</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/ilyaqa/Projects/GigaAM/.venv/bin/python</string>
+    <string>-m</string>
+    <string>chatgpt_transcriber.server</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>CHATGPT_TRANSCRIBER_ENV_FILE</key>
+    <string>/Users/ilyaqa/Projects/GigaAM/.local/gigaam-chatgpt-tunnel.env</string>
+    <key>CHATGPT_TRANSCRIBER_SERVICE_URL</key>
+    <string>http://127.0.0.1:18103</string>
+    <key>CHATGPT_TRANSCRIBER_HOST</key>
+    <string>127.0.0.1</string>
+    <key>CHATGPT_TRANSCRIBER_PORT</key>
+    <string>18110</string>
+    <key>CHATGPT_TRANSCRIBER_TEMP_ROOT</key>
+    <string>/Users/ilyaqa/Projects/GigaAM/.local/chatgpt_transcriber/tmp</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/ilyaqa/Library/Logs/gigaam-chatgpt/bridge.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/ilyaqa/Library/Logs/gigaam-chatgpt/bridge.err.log</string>
+</dict>
+</plist>
