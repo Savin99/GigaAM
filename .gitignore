@@ -12,7 +12,13 @@ train_utils/checkpoints
 .local/
 .mypy_cache
 .pytest_cache
-scripts
+.ruff_cache
+/scripts
+
+# local env secrets
+.env
+.env.*
+!.env.example
 
 # coverage artifacts
 .coverage
